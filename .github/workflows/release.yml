@@ -21,7 +21,7 @@ jobs:
             archive_ext: tar.gz
             bin_name: kitten-tts
           - os: macos-latest
-            target: x86_64-apple-darwin
+            target: aarch64-apple-darwin
             archive_ext: tar.gz
             bin_name: kitten-tts
           - os: windows-latest
