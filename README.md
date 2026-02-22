@@ -87,6 +87,26 @@ kitten-tts play \
   --phonemizer espeak-ng
 ```
 
+Optional helper script (repo example):
+
+```bash
+chmod +x examples/kitten-say.sh
+ORT_LIB=/path/to/libonnxruntime.so \
+CUDA_LIB_DIR=/path/to/cuda/lib \
+CUDNN_LIB_DIR=/path/to/cudnn/lib \
+examples/kitten-say.sh "hello world"
+```
+
+Optional make target:
+
+```bash
+make say \
+  SAY_TEXT="hello world" \
+  ORT_LIB=/path/to/libonnxruntime.so \
+  CUDA_LIB_DIR=/path/to/cuda/lib \
+  CUDNN_LIB_DIR=/path/to/cudnn/lib
+```
+
 ## Usage
 
 Synthesize WAV:
