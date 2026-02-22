@@ -4,7 +4,7 @@ use directories::ProjectDirs;
 use ndarray::{Array1, Array2};
 use once_cell::sync::{Lazy, OnceCell};
 use ort::{
-    inputs,
+    ep, inputs,
     session::{Session, builder::GraphOptimizationLevel},
     value::Tensor,
 };
@@ -17,13 +17,29 @@ use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zip::ZipArchive;
 
 const DEFAULT_REPO_ID: &str = "KittenML/kitten-tts-nano-0.8-fp32";
 const DEFAULT_SAMPLE_RATE: u32 = 24_000;
 const DEFAULT_MAX_CHARS: usize = 400;
 const DEFAULT_TRIM_TAIL: usize = 5_000;
+const DEFAULT_PLAY_GAIN: f32 = 2.5;
+const DEFAULT_CUDA_MEMORY_LIMIT_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const DEFAULT_CUDA_DEVICE_ID: i32 = 0;
+const SAFE_INTRA_THREADS: usize = 1;
+const SAFE_INTER_THREADS: usize = 1;
+const MAX_INPUT_TOKENS: usize = 510;
+const MAX_TOTAL_INPUT_CHARS: usize = 20_000;
+const MAX_SYNTHESIS_CHUNKS: usize = 256;
+const MAX_CHARS_HARD_LIMIT: usize = 2_000;
+const MIN_SPEED: f32 = 0.5;
+const MAX_SPEED: f32 = 2.0;
+const MIN_OUTPUT_GAIN: f32 = 0.1;
+const MAX_OUTPUT_GAIN: f32 = 8.0;
+const SAFE_PLAYBACK_PEAK: f32 = 0.98;
+const TOKEN_PAD_ID: i64 = 0;
+const MAX_NPY_ENTRY_BYTES: u64 = 50 * 1024 * 1024;
 
 static TOKEN_SPLIT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\w+|[^\w\s]").expect("valid regex"));
 static SENTENCE_SPLIT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[.!?]+").expect("valid regex"));
@@ -54,8 +70,11 @@ struct SynthesizeArgs {
     model: ModelSelection,
     #[command(flatten)]
     text: TextInput,
-    #[arg(long, default_value = "Leo")]
-    voice: String,
+    #[arg(
+        long,
+        help = "Voice name/alias. If omitted, pick a random available voice"
+    )]
+    voice: Option<String>,
     #[arg(long, default_value_t = 1.0)]
     speed: f32,
     #[arg(long, default_value_t = DEFAULT_SAMPLE_RATE)]
@@ -66,7 +85,9 @@ struct SynthesizeArgs {
     trim_tail: usize,
     #[arg(long)]
     style_index: Option<usize>,
-    #[arg(long, value_enum, default_value_t = PhonemizerMode::Auto)]
+    #[arg(long, help = "Random seed for reproducible voice/style selection")]
+    seed: Option<u64>,
+    #[arg(long, value_enum, default_value_t = PhonemizerMode::EspeakNg)]
     phonemizer: PhonemizerMode,
     #[arg(long, default_value = "output.wav")]
     output: PathBuf,
@@ -80,8 +101,11 @@ struct StreamArgs {
     model: ModelSelection,
     #[command(flatten)]
     text: TextInput,
-    #[arg(long, default_value = "Leo")]
-    voice: String,
+    #[arg(
+        long,
+        help = "Voice name/alias. If omitted, pick a random available voice"
+    )]
+    voice: Option<String>,
     #[arg(long, default_value_t = 1.0)]
     speed: f32,
     #[arg(long, default_value_t = DEFAULT_SAMPLE_RATE)]
@@ -92,7 +116,9 @@ struct StreamArgs {
     trim_tail: usize,
     #[arg(long)]
     style_index: Option<usize>,
-    #[arg(long, value_enum, default_value_t = PhonemizerMode::Auto)]
+    #[arg(long, help = "Random seed for reproducible voice/style selection")]
+    seed: Option<u64>,
+    #[arg(long, value_enum, default_value_t = PhonemizerMode::EspeakNg)]
     phonemizer: PhonemizerMode,
 }
 
@@ -102,8 +128,11 @@ struct PlayArgs {
     model: ModelSelection,
     #[command(flatten)]
     text: TextInput,
-    #[arg(long, default_value = "Leo")]
-    voice: String,
+    #[arg(
+        long,
+        help = "Voice name/alias. If omitted, pick a random available voice"
+    )]
+    voice: Option<String>,
     #[arg(long, default_value_t = 1.0)]
     speed: f32,
     #[arg(long, default_value_t = DEFAULT_SAMPLE_RATE)]
@@ -114,10 +143,24 @@ struct PlayArgs {
     trim_tail: usize,
     #[arg(long)]
     style_index: Option<usize>,
-    #[arg(long, value_enum, default_value_t = PhonemizerMode::Auto)]
+    #[arg(long, help = "Random seed for reproducible voice/style selection")]
+    seed: Option<u64>,
+    #[arg(long, value_enum, default_value_t = PhonemizerMode::EspeakNg)]
     phonemizer: PhonemizerMode,
     #[arg(long, value_enum, default_value_t = PlayerMode::Auto)]
     player: PlayerMode,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PLAY_GAIN,
+        help = "Playback gain multiplier applied before speaker output"
+    )]
+    gain: f32,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Allow clipping instead of automatically limiting playback gain"
+    )]
+    allow_clipping: bool,
 }
 
 #[derive(Debug, Args)]
@@ -171,6 +214,22 @@ struct ModelSelection {
     repo_id: Option<String>,
     #[arg(long)]
     cache_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Path to libonnxruntime shared library for dynamic loading"
+    )]
+    ort_lib: Option<PathBuf>,
+    #[arg(long, help = "Directory containing CUDA runtime shared libraries")]
+    cuda_lib_dir: Option<PathBuf>,
+    #[arg(long, help = "Directory containing cuDNN shared libraries")]
+    cudnn_lib_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OrtRuntimeConfig {
+    ort_lib: Option<PathBuf>,
+    cuda_lib_dir: Option<PathBuf>,
+    cudnn_lib_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -192,7 +251,6 @@ enum PhonemizerMode {
     Auto,
     EspeakNg,
     Espeak,
-    Basic,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -252,6 +310,14 @@ impl ModelSelection {
         let dirs = ProjectDirs::from("io", "KittenML", "kitten-tts")
             .ok_or_else(|| anyhow!("could not determine platform cache directory"))?;
         Ok(dirs.cache_dir().to_path_buf())
+    }
+
+    fn resolve_ort_runtime_config(&self) -> OrtRuntimeConfig {
+        OrtRuntimeConfig {
+            ort_lib: self.ort_lib.clone(),
+            cuda_lib_dir: self.cuda_lib_dir.clone(),
+            cudnn_lib_dir: self.cudnn_lib_dir.clone(),
+        }
     }
 }
 
@@ -327,7 +393,14 @@ impl VoiceTable {
             }
 
             let mut raw = Vec::new();
-            entry.read_to_end(&mut raw)?;
+            (&mut entry)
+                .take(MAX_NPY_ENTRY_BYTES + 1)
+                .read_to_end(&mut raw)?;
+            if raw.len() as u64 > MAX_NPY_ENTRY_BYTES {
+                bail!(
+                    "npy entry '{name}' exceeds maximum allowed size ({MAX_NPY_ENTRY_BYTES} bytes)"
+                );
+            }
             let (rows, cols, data) =
                 parse_npy_f32(&raw).with_context(|| format!("failed parsing npy entry: {name}"))?;
 
@@ -392,14 +465,12 @@ impl TextCleaner {
         }
     }
 
-    fn encode(&self, text: &str) -> Vec<i64> {
-        let mut indexes = Vec::with_capacity(text.len());
+    fn encode_into(&self, text: &str, out: &mut Vec<i64>) {
         for ch in text.chars() {
             if let Some(index) = self.word_index_dictionary.get(&ch) {
-                indexes.push(*index);
+                out.push(*index);
             }
         }
-        indexes
     }
 }
 
@@ -452,23 +523,6 @@ impl Phonemizer for EspeakPhonemizer {
     }
 }
 
-#[derive(Debug)]
-struct BasicPhonemizer;
-
-impl Phonemizer for BasicPhonemizer {
-    fn name(&self) -> &str {
-        "basic"
-    }
-
-    fn phonemize(&self, text: &str) -> Result<String> {
-        let normalized = SPACES_RE.replace_all(text.trim(), " ").to_string();
-        if normalized.is_empty() {
-            bail!("basic phonemizer received empty text")
-        }
-        Ok(normalized)
-    }
-}
-
 fn detect_phonemizer(mode: PhonemizerMode) -> Result<Box<dyn Phonemizer>> {
     match mode {
         PhonemizerMode::Auto => {
@@ -482,10 +536,7 @@ fn detect_phonemizer(mode: PhonemizerMode) -> Result<Box<dyn Phonemizer>> {
                     program: "espeak".to_string(),
                 }));
             }
-            eprintln!(
-                "warning: no espeak binary found; falling back to basic grapheme mode (lower quality)"
-            );
-            Ok(Box::new(BasicPhonemizer))
+            bail!("no espeak phonemizer found on PATH (tried: espeak-ng, espeak)")
         }
         PhonemizerMode::EspeakNg => {
             if !executable_in_path("espeak-ng") {
@@ -503,7 +554,6 @@ fn detect_phonemizer(mode: PhonemizerMode) -> Result<Box<dyn Phonemizer>> {
                 program: "espeak".to_string(),
             }))
         }
-        PhonemizerMode::Basic => Ok(Box::new(BasicPhonemizer)),
     }
 }
 
@@ -577,14 +627,80 @@ struct Synthesizer {
     text_cleaner: TextCleaner,
     speed_priors: HashMap<String, f32>,
     voice_aliases: HashMap<String, String>,
+    random_voice_state_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SynthesisConfig {
+    speed: f32,
+    max_chars: usize,
+    trim_tail: usize,
+    style_index: Option<usize>,
+    seed: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SimpleRng {
+    state: u64,
+}
+
+impl SimpleRng {
+    fn from_seed(seed: u64) -> Self {
+        // Avoid a zero-only cycle in xorshift.
+        let state = if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        };
+        Self { state }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        // xorshift64* PRNG; fast and sufficient for style/voice selection.
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn gen_index(&mut self, upper_exclusive: usize) -> usize {
+        if upper_exclusive <= 1 {
+            return 0;
+        }
+        (self.next_u64() as usize) % upper_exclusive
+    }
 }
 
 impl Synthesizer {
-    fn new(artifacts: &ModelArtifacts) -> Result<Self> {
-        init_ort()?;
+    fn new(artifacts: &ModelArtifacts, ort_runtime: &OrtRuntimeConfig) -> Result<Self> {
+        init_ort(ort_runtime)?;
 
-        let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
+        let cuda_ep = ep::CUDA::default()
+            .with_device_id(DEFAULT_CUDA_DEVICE_ID)
+            .with_memory_limit(DEFAULT_CUDA_MEMORY_LIMIT_BYTES)
+            .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Heuristic)
+            .with_conv_max_workspace(false)
+            .build()
+            .error_on_failure();
+
+        let session_builder = Session::builder()?
+            .with_no_environment_execution_providers()?
+            .with_parallel_execution(false)?
+            .with_intra_threads(SAFE_INTRA_THREADS)?
+            .with_inter_threads(SAFE_INTER_THREADS)?
+            .with_intra_op_spinning(false)?
+            .with_inter_op_spinning(false)?
+            .with_memory_pattern(false)?
+            .with_deterministic_compute(true)?;
+
+        let session = session_builder
+            .with_execution_providers([cuda_ep])
+            .context(
+                "failed enabling CUDA execution provider (GPU is required; ensure CUDA 12 + cuDNN runtime libraries are installed)",
+            )?
+            .with_optimization_level(GraphOptimizationLevel::Level1)?
             .commit_from_file(&artifacts.model_path)
             .with_context(|| {
                 format!(
@@ -601,59 +717,127 @@ impl Synthesizer {
             text_cleaner: TextCleaner::new(),
             speed_priors: artifacts.config.speed_priors.clone(),
             voice_aliases: artifacts.config.voice_aliases.clone(),
+            random_voice_state_path: artifacts.cache_dir.join("last_random_voice.txt"),
         })
     }
 
     fn synthesize(
         &mut self,
         text: &str,
-        voice: &str,
-        speed: f32,
-        max_chars: usize,
-        trim_tail: usize,
-        style_index: Option<usize>,
+        voice: Option<&str>,
+        config: SynthesisConfig,
         phonemizer: &dyn Phonemizer,
     ) -> Result<Vec<f32>> {
+        let mut output = Vec::new();
+        self.synthesize_streaming(text, voice, config, phonemizer, |chunk| {
+            output.extend_from_slice(chunk);
+            Ok(())
+        })?;
+        Ok(output)
+    }
+
+    fn synthesize_streaming(
+        &mut self,
+        text: &str,
+        voice: Option<&str>,
+        config: SynthesisConfig,
+        phonemizer: &dyn Phonemizer,
+        mut on_chunk: impl FnMut(&[f32]) -> Result<()>,
+    ) -> Result<()> {
+        if !config.speed.is_finite() || !(MIN_SPEED..=MAX_SPEED).contains(&config.speed) {
+            bail!("speed must be between {MIN_SPEED} and {MAX_SPEED}");
+        }
+        if config.max_chars == 0 || config.max_chars > MAX_CHARS_HARD_LIMIT {
+            bail!(
+                "max_chars must be between 1 and {MAX_CHARS_HARD_LIMIT} to avoid unsafe runtime load"
+            );
+        }
         let cleaned = clean_text_basic(text);
         if cleaned.is_empty() {
             bail!("input text is empty after basic normalization");
         }
+        if cleaned.len() > MAX_TOTAL_INPUT_CHARS {
+            bail!(
+                "input text too long ({} chars). Max allowed is {} for runtime safety",
+                cleaned.len(),
+                MAX_TOTAL_INPUT_CHARS
+            );
+        }
 
-        let chunks = chunk_text(&cleaned, max_chars);
+        let chunks = chunk_text(&cleaned, config.max_chars);
         if chunks.is_empty() {
             bail!("input text produced zero chunks");
         }
+        if chunks.len() > MAX_SYNTHESIS_CHUNKS {
+            bail!(
+                "input produced too many chunks ({}). Max allowed is {} for runtime safety",
+                chunks.len(),
+                MAX_SYNTHESIS_CHUNKS
+            );
+        }
 
-        let canonical_voice = self.resolve_voice(voice)?;
+        let mut rng = SimpleRng::from_seed(config.seed.unwrap_or_else(runtime_entropy_seed));
+        let canonical_voice = self.resolve_voice(voice, &mut rng)?;
+        let max_rows = self.voice_table.max_style_rows(&canonical_voice)?;
+        let style_ref_id = resolve_style_index(max_rows, config.style_index, &mut rng);
+        if voice.is_none() {
+            eprintln!("using random voice: {canonical_voice}");
+        }
+        if config.style_index.is_none() {
+            eprintln!("using random style-index: {style_ref_id}");
+        }
 
-        let mut output = Vec::new();
         for chunk in chunks {
-            let mut chunk_audio = self.synthesize_single_chunk(
+            let chunk_audio = self.synthesize_single_chunk(
                 &chunk,
                 &canonical_voice,
-                speed,
-                trim_tail,
-                style_index,
+                config.speed,
+                config.trim_tail,
+                style_ref_id,
                 phonemizer,
             )?;
-            output.append(&mut chunk_audio);
+            on_chunk(&chunk_audio)?;
         }
 
-        Ok(output)
+        Ok(())
     }
 
-    fn resolve_voice(&self, voice: &str) -> Result<String> {
-        let resolved = self
-            .voice_aliases
-            .get(voice)
-            .cloned()
-            .unwrap_or_else(|| voice.to_string());
+    fn resolve_voice(&self, voice: Option<&str>, rng: &mut SimpleRng) -> Result<String> {
+        if let Some(voice) = voice {
+            let resolved = self
+                .voice_aliases
+                .get(voice)
+                .cloned()
+                .unwrap_or_else(|| voice.to_string());
 
-        if self.voice_table.voices.contains_key(&resolved) {
-            return Ok(resolved);
+            if self.voice_table.voices.contains_key(&resolved) {
+                return Ok(resolved);
+            }
+
+            bail!("voice '{voice}' is not available. Run `kitten-tts voices` to list voices");
         }
 
-        bail!("voice '{voice}' is not available. Run `kitten-tts voices` to list voices")
+        let canonical = self.voice_table.canonical_voices();
+        if canonical.is_empty() {
+            bail!("no voices available in voice table");
+        }
+
+        let previous = load_last_random_voice(&self.random_voice_state_path);
+        let mut candidates = canonical;
+        if let Some(previous) = previous
+            && candidates.len() > 1
+        {
+            candidates.retain(|v| v != &previous);
+        }
+
+        let selected = candidates[rng.gen_index(candidates.len())].clone();
+        if let Err(err) = store_last_random_voice(&self.random_voice_state_path, &selected) {
+            eprintln!(
+                "warning: could not persist last random voice to {}: {err}",
+                self.random_voice_state_path.display()
+            );
+        }
+        Ok(selected)
     }
 
     fn synthesize_single_chunk(
@@ -662,7 +846,7 @@ impl Synthesizer {
         voice: &str,
         speed: f32,
         trim_tail: usize,
-        style_index: Option<usize>,
+        style_ref_id: usize,
         phonemizer: &dyn Phonemizer,
     ) -> Result<Vec<f32>> {
         let mut tokens = tokenize_phonemes(
@@ -678,13 +862,18 @@ impl Synthesizer {
         if tokens.is_empty() {
             bail!("tokenizer produced empty token sequence for chunk '{chunk}'");
         }
+        if tokens.len() > MAX_INPUT_TOKENS {
+            bail!(
+                "phonemized chunk produced {} tokens (max {MAX_INPUT_TOKENS}). \
+                 Reduce --max-chars to produce shorter chunks",
+                tokens.len()
+            );
+        }
 
-        tokens.insert(0, 0);
-        tokens.push(0);
+        tokens.insert(0, TOKEN_PAD_ID);
+        tokens.push(TOKEN_PAD_ID);
 
-        let max_rows = self.voice_table.max_style_rows(voice)?;
-        let ref_id = resolve_style_index(chunk.len(), max_rows, style_index);
-        let style = self.voice_table.style_row(voice, ref_id)?.to_vec();
+        let style = self.voice_table.style_row(voice, style_ref_id)?.to_vec();
         let adjusted_speed = speed * self.speed_priors.get(voice).copied().unwrap_or(1.0);
 
         let input_ids = Array2::from_shape_vec((1, tokens.len()), tokens)
@@ -699,7 +888,11 @@ impl Synthesizer {
             "speed" => Tensor::from_array(speed)?
         ])?;
 
-        let (_, data) = outputs[0]
+        if outputs.len() == 0 {
+            bail!("onnx model returned no output tensors");
+        }
+        let first_output = &outputs[0];
+        let (_, data) = first_output
             .try_extract_tensor::<f32>()
             .context("failed extracting f32 output tensor")?;
         let mut audio = data.to_vec();
@@ -716,9 +909,9 @@ impl Synthesizer {
 }
 
 fn resolve_style_index(
-    text_len: usize,
     max_rows: usize,
     explicit_style_index: Option<usize>,
+    rng: &mut SimpleRng,
 ) -> usize {
     if max_rows == 0 {
         return 0;
@@ -726,29 +919,82 @@ fn resolve_style_index(
     let max_index = max_rows.saturating_sub(1);
     match explicit_style_index {
         Some(i) => usize::min(i, max_index),
-        None => usize::min(text_len, max_index),
+        None => rng.gen_index(max_rows),
     }
 }
 
-fn init_ort() -> Result<()> {
-    ORT_INIT.get_or_init(|| {
-        let _ = ort::init().with_name("kitten-tts").commit();
-    });
+fn runtime_entropy_seed() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_nanos();
+    let pid = u64::from(std::process::id());
+    (nanos as u64) ^ (nanos >> 64) as u64 ^ pid.rotate_left(13)
+}
+
+fn load_last_random_voice(path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    let voice = raw.trim();
+    if voice.is_empty() {
+        return None;
+    }
+    Some(voice.to_string())
+}
+
+fn store_last_random_voice(path: &Path, voice: &str) -> Result<()> {
+    fs::write(path, voice)
+        .with_context(|| format!("failed writing random voice state file {}", path.display()))
+}
+
+fn init_ort(config: &OrtRuntimeConfig) -> Result<()> {
+    ORT_INIT.get_or_try_init(|| -> Result<()> {
+        if config.cuda_lib_dir.is_some() || config.cudnn_lib_dir.is_some() {
+            ep::cuda::preload_dylibs(
+                config.cuda_lib_dir.as_deref(),
+                config.cudnn_lib_dir.as_deref(),
+            )
+            .context("failed preloading CUDA/cuDNN shared libraries")?;
+        }
+
+        let ort_lib = config
+            .ort_lib
+            .clone()
+            .or_else(|| std::env::var_os("ORT_DYLIB_PATH").map(PathBuf::from))
+            .unwrap_or_else(|| {
+                #[cfg(target_os = "windows")]
+                let lib = "onnxruntime.dll";
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let lib = "libonnxruntime.so";
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                let lib = "libonnxruntime.dylib";
+                PathBuf::from(lib)
+            });
+
+        let _ = ort::init_from(&ort_lib)
+            .with_context(|| {
+                format!(
+                    "failed loading ONNX Runtime shared library from {}",
+                    ort_lib.display()
+                )
+            })?
+            .with_name("kitten-tts")
+            .commit();
+
+        Ok(())
+    })?;
     Ok(())
 }
 
 fn tokenize_phonemes(cleaner: &TextCleaner, phonemes: &str) -> Vec<i64> {
     let mut tokens = Vec::new();
-    let pieces: Vec<&str> = TOKEN_SPLIT_RE
-        .find_iter(phonemes)
-        .map(|m| m.as_str())
-        .collect();
-    if pieces.is_empty() {
-        return tokens;
+    let mut had_piece = false;
+    for piece in TOKEN_SPLIT_RE.find_iter(phonemes) {
+        if had_piece {
+            cleaner.encode_into(" ", &mut tokens);
+        }
+        cleaner.encode_into(piece.as_str(), &mut tokens);
+        had_piece = true;
     }
-
-    let joined = pieces.join(" ");
-    tokens.extend(cleaner.encode(&joined));
     tokens
 }
 
@@ -854,11 +1100,13 @@ fn ensure_model_cached(
     let model_dir = cache_model_dir(cache_root, repo_id);
     fs::create_dir_all(&model_dir)
         .with_context(|| format!("failed creating cache dir {}", model_dir.display()))?;
+    let mut cache_updated = false;
 
     let config_path = model_dir.join("config.json");
     if force || !config_path.exists() {
         download_repo_file(client, repo_id, "config.json", &config_path)
             .with_context(|| format!("failed downloading config.json for {repo_id}"))?;
+        cache_updated = true;
     }
 
     let config: ModelConfig = serde_json::from_str(
@@ -883,26 +1131,30 @@ fn ensure_model_cached(
     if force || !model_path.exists() {
         download_repo_file(client, repo_id, model_file, &model_path)
             .with_context(|| format!("failed downloading model file {model_file}"))?;
+        cache_updated = true;
     }
 
     if force || !voices_path.exists() {
         download_repo_file(client, repo_id, voices_file, &voices_path)
             .with_context(|| format!("failed downloading voices file {voices_file}"))?;
+        cache_updated = true;
     }
 
-    let manifest = CacheManifest {
-        repo_id: repo_id.to_string(),
-        fetched_at_unix: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        model_file: model_file.to_string(),
-        voices_file: voices_file.to_string(),
-    };
     let manifest_path = model_dir.join("manifest.json");
-    let manifest_json = serde_json::to_string_pretty(&manifest)?;
-    fs::write(&manifest_path, manifest_json)
-        .with_context(|| format!("failed writing manifest at {}", manifest_path.display()))?;
+    if cache_updated || !manifest_path.exists() {
+        let manifest = CacheManifest {
+            repo_id: repo_id.to_string(),
+            fetched_at_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            model_file: model_file.to_string(),
+            voices_file: voices_file.to_string(),
+        };
+        let manifest_json = serde_json::to_string_pretty(&manifest)?;
+        fs::write(&manifest_path, manifest_json)
+            .with_context(|| format!("failed writing manifest at {}", manifest_path.display()))?;
+    }
 
     Ok(ModelArtifacts {
         repo_id: repo_id.to_string(),
@@ -918,28 +1170,35 @@ fn download_repo_file(client: &Client, repo_id: &str, file_name: &str, dest: &Pa
     let url = format!("https://huggingface.co/{repo_id}/resolve/main/{file_name}?download=true");
 
     let temp_path = dest.with_extension("download.tmp");
-    let mut response = client
-        .get(&url)
-        .send()
-        .with_context(|| format!("http request failed for {url}"))?
-        .error_for_status()
-        .with_context(|| format!("download failed for {url}"))?;
+    let result = (|| -> Result<()> {
+        let mut response = client
+            .get(&url)
+            .send()
+            .with_context(|| format!("http request failed for {url}"))?
+            .error_for_status()
+            .with_context(|| format!("download failed for {url}"))?;
 
-    let mut file = File::create(&temp_path)
-        .with_context(|| format!("failed creating temp file {}", temp_path.display()))?;
-    io::copy(&mut response, &mut file)
-        .with_context(|| format!("failed writing to temp file {}", temp_path.display()))?;
-    file.flush()?;
+        let mut file = File::create(&temp_path)
+            .with_context(|| format!("failed creating temp file {}", temp_path.display()))?;
+        io::copy(&mut response, &mut file)
+            .with_context(|| format!("failed writing to temp file {}", temp_path.display()))?;
+        file.flush()?;
 
-    fs::rename(&temp_path, dest).with_context(|| {
-        format!(
-            "failed moving temp file {} to {}",
-            temp_path.display(),
-            dest.display()
-        )
-    })?;
+        fs::rename(&temp_path, dest).with_context(|| {
+            format!(
+                "failed moving temp file {} to {}",
+                temp_path.display(),
+                dest.display()
+            )
+        })?;
 
-    Ok(())
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn read_text_input(text_input: &TextInput) -> Result<String> {
@@ -999,41 +1258,67 @@ fn write_wav(path: &Path, sample_rate: u32, encoding: WavEncoding, audio: &[f32]
     Ok(())
 }
 
-fn write_pcm_f32_stdout(audio: &[f32]) -> Result<()> {
-    let mut stdout = io::stdout().lock();
-    for sample in audio {
-        stdout.write_all(&sample.to_le_bytes())?;
+fn apply_playback_gain(audio: &[f32], gain: f32, allow_clipping: bool) -> Result<(Vec<f32>, f32)> {
+    if !gain.is_finite() || !(MIN_OUTPUT_GAIN..=MAX_OUTPUT_GAIN).contains(&gain) {
+        bail!("gain must be between {MIN_OUTPUT_GAIN} and {MAX_OUTPUT_GAIN}");
     }
-    stdout.flush()?;
-    Ok(())
+
+    let peak = audio
+        .iter()
+        .fold(0.0_f32, |acc, sample| acc.max(sample.abs()));
+    let mut applied_gain = gain;
+    if !allow_clipping && peak > 0.0 {
+        let max_gain_without_clipping = SAFE_PLAYBACK_PEAK / peak;
+        if applied_gain > max_gain_without_clipping {
+            applied_gain = max_gain_without_clipping;
+        }
+    }
+
+    let gained = if (applied_gain - 1.0).abs() < f32::EPSILON {
+        audio.to_vec()
+    } else {
+        audio.iter().map(|sample| *sample * applied_gain).collect()
+    };
+
+    Ok((gained, applied_gain))
 }
 
-fn play_audio(audio: &[f32], sample_rate: u32, player_mode: PlayerMode) -> Result<()> {
+fn play_audio(
+    audio: &[f32],
+    sample_rate: u32,
+    player_mode: PlayerMode,
+    gain: f32,
+    allow_clipping: bool,
+) -> Result<()> {
     let player = detect_player(player_mode)?;
-    let temp_path = std::env::temp_dir().join(format!(
-        "kitten-tts-play-{}-{}.wav",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    ));
+    let (playback_audio, applied_gain) = apply_playback_gain(audio, gain, allow_clipping)?;
+    if !allow_clipping && applied_gain + f32::EPSILON < gain {
+        eprintln!(
+            "requested gain {:.2} was limited to {:.2} to avoid clipping",
+            gain, applied_gain
+        );
+    }
 
-    write_wav(&temp_path, sample_rate, WavEncoding::Pcm16, audio)?;
+    let temp_file = tempfile::Builder::new()
+        .prefix("kitten-tts-play-")
+        .suffix(".wav")
+        .tempfile()
+        .context("failed creating temporary wav file for playback")?;
+    let temp_path = temp_file.path();
+
+    write_wav(temp_path, sample_rate, WavEncoding::Pcm16, &playback_audio)?;
     let status = match player {
         "ffplay" => Command::new("ffplay")
             .args(["-autoexit", "-nodisp", "-loglevel", "error"])
-            .arg(&temp_path)
+            .arg(temp_path)
             .status()
             .context("failed to launch ffplay")?,
         "pw-play" => Command::new("pw-play")
-            .arg(&temp_path)
+            .arg(temp_path)
             .status()
             .context("failed to launch pw-play")?,
         _ => bail!("unsupported player selected"),
     };
-
-    let _ = fs::remove_file(&temp_path);
     if !status.success() {
         bail!("audio player exited with failure status: {status}");
     }
@@ -1149,8 +1434,26 @@ fn parse_shape(header: &str) -> Option<Vec<usize>> {
 fn build_http_client() -> Result<Client> {
     Client::builder()
         .user_agent("kitten-tts-rs/0.1.0")
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
         .build()
         .context("failed building HTTP client")
+}
+
+fn prepare_synthesis_runtime(
+    model: &ModelSelection,
+    text_input: &TextInput,
+    phonemizer_mode: PhonemizerMode,
+) -> Result<(String, Synthesizer, Box<dyn Phonemizer>)> {
+    let text = read_text_input(text_input)?;
+    let client = build_http_client()?;
+    let cache_root = model.resolve_cache_dir()?;
+    let repo_id = model.resolve_repo_id();
+    let ort_runtime = model.resolve_ort_runtime_config();
+    let artifacts = ensure_model_cached(&client, &cache_root, &repo_id, false)?;
+    let synthesizer = Synthesizer::new(&artifacts, &ort_runtime)?;
+    let phonemizer = detect_phonemizer(phonemizer_mode)?;
+    Ok((text, synthesizer, phonemizer))
 }
 
 fn main() -> Result<()> {
@@ -1224,41 +1527,45 @@ fn main() -> Result<()> {
             }
         }
         Commands::Play(args) => {
-            let text = read_text_input(&args.text)?;
-            let client = build_http_client()?;
-            let cache_root = args.model.resolve_cache_dir()?;
-            let repo_id = args.model.resolve_repo_id();
-            let artifacts = ensure_model_cached(&client, &cache_root, &repo_id, false)?;
-            let mut synthesizer = Synthesizer::new(&artifacts)?;
-            let phonemizer = detect_phonemizer(args.phonemizer)?;
+            let (text, mut synthesizer, phonemizer) =
+                prepare_synthesis_runtime(&args.model, &args.text, args.phonemizer)?;
+            let config = SynthesisConfig {
+                speed: args.speed,
+                max_chars: args.max_chars,
+                trim_tail: args.trim_tail,
+                style_index: args.style_index,
+                seed: args.seed,
+            };
 
             let audio = synthesizer.synthesize(
                 &text,
-                &args.voice,
-                args.speed,
-                args.max_chars,
-                args.trim_tail,
-                args.style_index,
+                args.voice.as_deref(),
+                config,
                 phonemizer.as_ref(),
             )?;
-            play_audio(&audio, args.sample_rate, args.player)?;
+            play_audio(
+                &audio,
+                args.sample_rate,
+                args.player,
+                args.gain,
+                args.allow_clipping,
+            )?;
         }
         Commands::Synthesize(args) => {
-            let text = read_text_input(&args.text)?;
-            let client = build_http_client()?;
-            let cache_root = args.model.resolve_cache_dir()?;
-            let repo_id = args.model.resolve_repo_id();
-            let artifacts = ensure_model_cached(&client, &cache_root, &repo_id, false)?;
-            let mut synthesizer = Synthesizer::new(&artifacts)?;
-            let phonemizer = detect_phonemizer(args.phonemizer)?;
+            let (text, mut synthesizer, phonemizer) =
+                prepare_synthesis_runtime(&args.model, &args.text, args.phonemizer)?;
+            let config = SynthesisConfig {
+                speed: args.speed,
+                max_chars: args.max_chars,
+                trim_tail: args.trim_tail,
+                style_index: args.style_index,
+                seed: args.seed,
+            };
 
             let audio = synthesizer.synthesize(
                 &text,
-                &args.voice,
-                args.speed,
-                args.max_chars,
-                args.trim_tail,
-                args.style_index,
+                args.voice.as_deref(),
+                config,
                 phonemizer.as_ref(),
             )?;
 
@@ -1266,24 +1573,31 @@ fn main() -> Result<()> {
             eprintln!("wrote {} samples to {}", audio.len(), args.output.display());
         }
         Commands::Stream(args) => {
-            let text = read_text_input(&args.text)?;
-            let client = build_http_client()?;
-            let cache_root = args.model.resolve_cache_dir()?;
-            let repo_id = args.model.resolve_repo_id();
-            let artifacts = ensure_model_cached(&client, &cache_root, &repo_id, false)?;
-            let mut synthesizer = Synthesizer::new(&artifacts)?;
-            let phonemizer = detect_phonemizer(args.phonemizer)?;
+            let (text, mut synthesizer, phonemizer) =
+                prepare_synthesis_runtime(&args.model, &args.text, args.phonemizer)?;
+            let config = SynthesisConfig {
+                speed: args.speed,
+                max_chars: args.max_chars,
+                trim_tail: args.trim_tail,
+                style_index: args.style_index,
+                seed: args.seed,
+            };
 
-            let audio = synthesizer.synthesize(
+            let stdout = io::stdout();
+            let mut stdout = stdout.lock();
+            synthesizer.synthesize_streaming(
                 &text,
-                &args.voice,
-                args.speed,
-                args.max_chars,
-                args.trim_tail,
-                args.style_index,
+                args.voice.as_deref(),
+                config,
                 phonemizer.as_ref(),
+                |chunk| {
+                    for sample in chunk {
+                        stdout.write_all(&sample.to_le_bytes())?;
+                    }
+                    stdout.flush()?;
+                    Ok(())
+                },
             )?;
-            write_pcm_f32_stdout(&audio)?;
         }
     }
 
@@ -1318,6 +1632,9 @@ mod tests {
             model: None,
             repo_id: None,
             cache_dir: None,
+            ort_lib: None,
+            cuda_lib_dir: None,
+            cudnn_lib_dir: None,
         };
         assert_eq!(selection.resolve_repo_id(), DEFAULT_REPO_ID);
     }
@@ -1328,6 +1645,9 @@ mod tests {
             model: Some(ModelPreset::Micro08),
             repo_id: Some("KittenML/custom".to_string()),
             cache_dir: None,
+            ort_lib: None,
+            cuda_lib_dir: None,
+            cudnn_lib_dir: None,
         };
         assert_eq!(selection.resolve_repo_id(), "KittenML/custom");
     }
@@ -1366,14 +1686,45 @@ mod tests {
     }
 
     #[test]
-    fn resolve_style_index_uses_text_len_by_default() {
-        assert_eq!(resolve_style_index(25, 400, None), 25);
-        assert_eq!(resolve_style_index(999, 400, None), 399);
+    fn resolve_style_index_defaults_to_seeded_random_in_range() {
+        let mut a = SimpleRng::from_seed(1234);
+        let mut b = SimpleRng::from_seed(1234);
+        let idx_a = resolve_style_index(400, None, &mut a);
+        let idx_b = resolve_style_index(400, None, &mut b);
+        assert_eq!(idx_a, idx_b);
+        assert!(idx_a < 400);
     }
 
     #[test]
     fn resolve_style_index_honors_override_and_clamps() {
-        assert_eq!(resolve_style_index(10, 400, Some(4)), 4);
-        assert_eq!(resolve_style_index(10, 400, Some(9999)), 399);
+        let mut rng = SimpleRng::from_seed(42);
+        assert_eq!(resolve_style_index(400, Some(4), &mut rng), 4);
+        assert_eq!(resolve_style_index(400, Some(9999), &mut rng), 399);
+    }
+
+    #[test]
+    fn resolve_style_index_handles_empty_rows() {
+        let mut rng = SimpleRng::from_seed(1);
+        assert_eq!(resolve_style_index(0, None, &mut rng), 0);
+    }
+
+    #[test]
+    fn apply_playback_gain_limits_when_clipping_not_allowed() {
+        let audio = vec![0.8_f32, -0.8];
+        let (scaled, applied) = apply_playback_gain(&audio, 2.5, false).expect("gain should work");
+        assert!(applied < 2.5);
+        let peak = scaled
+            .iter()
+            .fold(0.0_f32, |acc, sample| acc.max(sample.abs()));
+        assert!(peak <= SAFE_PLAYBACK_PEAK + 1e-6);
+    }
+
+    #[test]
+    fn apply_playback_gain_honors_gain_when_clipping_allowed() {
+        let audio = vec![0.5_f32, -0.25];
+        let (scaled, applied) = apply_playback_gain(&audio, 2.0, true).expect("gain should work");
+        assert_eq!(applied, 2.0);
+        assert!((scaled[0] - 1.0).abs() < 1e-6);
+        assert!((scaled[1] + 0.5).abs() < 1e-6);
     }
 }
