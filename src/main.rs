@@ -1337,16 +1337,18 @@ fn parse_npy_f32(bytes: &[u8]) -> Result<(usize, usize, Vec<f32>)> {
     let (header_len, header_offset) = match major {
         1 => {
             let h = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
-            (h, 10)
+            (h, 10_usize)
         }
         2 | 3 => {
             let h = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
-            (h, 12)
+            (h, 12_usize)
         }
         other => bail!("unsupported npy version {other}"),
     };
 
-    let header_end = header_offset + header_len;
+    let header_end = header_offset
+        .checked_add(header_len)
+        .ok_or_else(|| anyhow!("npy header length overflow"))?;
     if bytes.len() < header_end {
         bail!("npy header length exceeds payload size");
     }
@@ -1374,12 +1376,15 @@ fn parse_npy_f32(bytes: &[u8]) -> Result<(usize, usize, Vec<f32>)> {
     let item_count = rows
         .checked_mul(cols)
         .ok_or_else(|| anyhow!("npy shape overflow for {rows}x{cols}"))?;
+    let expected_data_bytes = item_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow!("npy byte size overflow for {rows}x{cols}"))?;
 
     let data_bytes = &bytes[header_end..];
-    if data_bytes.len() != item_count * 4 {
+    if data_bytes.len() != expected_data_bytes {
         bail!(
             "npy data size mismatch: expected {} bytes, got {}",
-            item_count * 4,
+            expected_data_bytes,
             data_bytes.len()
         );
     }
@@ -1677,6 +1682,23 @@ mod tests {
     fn parse_shape_extracts_expected_values() {
         let header = "{'descr': '<f4', 'fortran_order': False, 'shape': (400, 256), }";
         assert_eq!(parse_shape(header), Some(vec![400, 256]));
+    }
+
+    #[test]
+    fn parse_npy_rejects_shape_that_overflows_byte_count() {
+        let header = format!(
+            "{{'descr': '<f4', 'fortran_order': False, 'shape': ({}, 1), }}",
+            usize::MAX
+        );
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x93NUMPY");
+        payload.push(2);
+        payload.push(0);
+        payload.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        payload.extend_from_slice(header.as_bytes());
+
+        let err = parse_npy_f32(&payload).expect_err("overflow shape should be rejected");
+        assert!(format!("{err:#}").contains("npy byte size overflow"));
     }
 
     #[test]
