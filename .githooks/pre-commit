@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── kitten-tts pre-commit hook ──────────────────────────────────────
+# Runs fmt check, clippy, and tests before every commit.
+# Install with:  git config core.hooksPath .githooks
+# ────────────────────────────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+pass() { printf "${GREEN}✓${RESET} %s\n" "$1"; }
+fail() { printf "${RED}✗${RESET} %s\n" "$1"; }
+
+errors=0
+
+printf "${BOLD}Running pre-commit checks…${RESET}\n"
+
+# 1. Format check
+if cargo fmt --all -- --check >/dev/null 2>&1; then
+    pass "cargo fmt"
+else
+    fail "cargo fmt — run 'cargo fmt --all' to fix"
+    errors=$((errors + 1))
+fi
+
+# 2. Clippy
+if cargo clippy --all-targets -- -D warnings >/dev/null 2>&1; then
+    pass "cargo clippy"
+else
+    fail "cargo clippy — warnings or errors found"
+    errors=$((errors + 1))
+fi
+
+# 3. Tests
+if cargo test --quiet >/dev/null 2>&1; then
+    pass "cargo test"
+else
+    fail "cargo test — one or more tests failed"
+    errors=$((errors + 1))
+fi
+
+# 4. Check for common mistakes in staged files
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+
+# 4a. Reject debug macros left in Rust source
+if echo "$staged" | grep -q '\.rs$'; then
+    rs_files=$(echo "$staged" | grep '\.rs$')
+    if git diff --cached -- $rs_files | grep -qE '^\+.*\bdbg!\('; then
+        fail "dbg!() macro found in staged code — remove before committing"
+        errors=$((errors + 1))
+    else
+        pass "no dbg!() macros"
+    fi
+fi
+
+# 4b. Reject committed secrets / tokens (exclude this hook file itself)
+if git diff --cached -U0 -- ':!.githooks/*' | grep -qiE '^\+.*(PRIVATE.KEY|sk_live|api_key\s*=\s*"[^"]+"|token\s*=\s*"[^"]+")'; then
+    fail "possible secret/token found in staged diff"
+    errors=$((errors + 1))
+else
+    pass "no secrets detected"
+fi
+
+if [ "$errors" -gt 0 ]; then
+    printf "\n${RED}${BOLD}Commit blocked — %d check(s) failed${RESET}\n" "$errors"
+    exit 1
+fi
+
+printf "\n${GREEN}${BOLD}All checks passed${RESET}\n"

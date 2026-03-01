@@ -37,6 +37,7 @@ const MIN_SPEED: f32 = 0.5;
 const MAX_SPEED: f32 = 2.0;
 const MIN_OUTPUT_GAIN: f32 = 0.1;
 const MAX_OUTPUT_GAIN: f32 = 8.0;
+const VRAM_HEADROOM_MIB: u64 = 512;
 const SAFE_PLAYBACK_PEAK: f32 = 0.98;
 const TOKEN_PAD_ID: i64 = 0;
 const MAX_NPY_ENTRY_BYTES: u64 = 50 * 1024 * 1024;
@@ -223,13 +224,22 @@ struct ModelSelection {
     cuda_lib_dir: Option<PathBuf>,
     #[arg(long, help = "Directory containing cuDNN shared libraries")]
     cudnn_lib_dir: Option<PathBuf>,
+    #[arg(long, help = "CUDA device index (default: 0)")]
+    cuda_device_id: Option<i32>,
+    #[arg(
+        long,
+        help = "CUDA memory arena limit in MiB (default: 2048). Lower this on GPUs with limited VRAM to avoid driver crashes"
+    )]
+    cuda_memory_limit: Option<usize>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct OrtRuntimeConfig {
     ort_lib: Option<PathBuf>,
     cuda_lib_dir: Option<PathBuf>,
     cudnn_lib_dir: Option<PathBuf>,
+    cuda_device_id: i32,
+    cuda_memory_limit_bytes: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -317,6 +327,11 @@ impl ModelSelection {
             ort_lib: self.ort_lib.clone(),
             cuda_lib_dir: self.cuda_lib_dir.clone(),
             cudnn_lib_dir: self.cudnn_lib_dir.clone(),
+            cuda_device_id: self.cuda_device_id.unwrap_or(DEFAULT_CUDA_DEVICE_ID),
+            cuda_memory_limit_bytes: self
+                .cuda_memory_limit
+                .map(|mib| mib * 1024 * 1024)
+                .unwrap_or(DEFAULT_CUDA_MEMORY_LIMIT_BYTES),
         }
     }
 }
@@ -677,9 +692,12 @@ impl Synthesizer {
     fn new(artifacts: &ModelArtifacts, ort_runtime: &OrtRuntimeConfig) -> Result<Self> {
         init_ort(ort_runtime)?;
 
+        let arena_mib = (ort_runtime.cuda_memory_limit_bytes / (1024 * 1024)) as u64;
+        check_gpu_vram(ort_runtime.cuda_device_id, arena_mib)?;
+
         let cuda_ep = ep::CUDA::default()
-            .with_device_id(DEFAULT_CUDA_DEVICE_ID)
-            .with_memory_limit(DEFAULT_CUDA_MEMORY_LIMIT_BYTES)
+            .with_device_id(ort_runtime.cuda_device_id)
+            .with_memory_limit(ort_runtime.cuda_memory_limit_bytes)
             .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Heuristic)
             .with_conv_max_workspace(false)
             .build()
@@ -944,6 +962,51 @@ fn load_last_random_voice(path: &Path) -> Option<String> {
 fn store_last_random_voice(path: &Path, voice: &str) -> Result<()> {
     fs::write(path, voice)
         .with_context(|| format!("failed writing random voice state file {}", path.display()))
+}
+
+fn check_gpu_vram(device_id: i32, arena_mib: u64) -> Result<()> {
+    let output = match Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.free",
+            "--format=csv,noheader,nounits",
+            &format!("--id={device_id}"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => {
+            eprintln!("warning: nvidia-smi not found; skipping VRAM availability check");
+            return Ok(());
+        }
+    };
+
+    if !output.status.success() {
+        eprintln!("warning: nvidia-smi failed; skipping VRAM availability check");
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let free_mib: u64 = match stdout.trim().parse() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("warning: could not parse nvidia-smi output; skipping VRAM check");
+            return Ok(());
+        }
+    };
+
+    let needed = arena_mib + VRAM_HEADROOM_MIB;
+    if free_mib < needed {
+        bail!(
+            "insufficient GPU VRAM on device {device_id}: {free_mib} MiB free, \
+             but ~{needed} MiB needed ({arena_mib} MiB arena + {VRAM_HEADROOM_MIB} MiB headroom). \
+             Lower --cuda-memory-limit or close GPU-intensive applications to avoid a system crash"
+        );
+    }
+
+    eprintln!("GPU device {device_id}: {free_mib} MiB free VRAM (need ~{needed} MiB)");
+    Ok(())
 }
 
 fn init_ort(config: &OrtRuntimeConfig) -> Result<()> {
@@ -1640,6 +1703,8 @@ mod tests {
             ort_lib: None,
             cuda_lib_dir: None,
             cudnn_lib_dir: None,
+            cuda_device_id: None,
+            cuda_memory_limit: None,
         };
         assert_eq!(selection.resolve_repo_id(), DEFAULT_REPO_ID);
     }
@@ -1653,6 +1718,8 @@ mod tests {
             ort_lib: None,
             cuda_lib_dir: None,
             cudnn_lib_dir: None,
+            cuda_device_id: None,
+            cuda_memory_limit: None,
         };
         assert_eq!(selection.resolve_repo_id(), "KittenML/custom");
     }
