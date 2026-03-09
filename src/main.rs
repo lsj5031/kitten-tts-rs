@@ -42,8 +42,6 @@ const SAFE_PLAYBACK_PEAK: f32 = 0.98;
 const TOKEN_PAD_ID: i64 = 0;
 const MAX_NPY_ENTRY_BYTES: u64 = 50 * 1024 * 1024;
 
-static TOKEN_SPLIT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\w+|[^\w\s]").expect("valid regex"));
-static SENTENCE_SPLIT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[.!?]+").expect("valid regex"));
 static SPACES_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").expect("valid regex"));
 static ORT_INIT: OnceCell<()> = OnceCell::new();
 
@@ -459,7 +457,7 @@ struct TextCleaner {
 impl TextCleaner {
     fn new() -> Self {
         let pad = "$";
-        let punctuation = ";:,.!?¡¿—…\"«»\"\" ";
+        let punctuation = ";:,.!?¡¿—…\"«»“” ";
         let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
         let letters_ipa = "ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘'̩'ᵻ";
 
@@ -1050,14 +1048,8 @@ fn init_ort(config: &OrtRuntimeConfig) -> Result<()> {
 
 fn tokenize_phonemes(cleaner: &TextCleaner, phonemes: &str) -> Vec<i64> {
     let mut tokens = Vec::new();
-    let mut had_piece = false;
-    for piece in TOKEN_SPLIT_RE.find_iter(phonemes) {
-        if had_piece {
-            cleaner.encode_into(" ", &mut tokens);
-        }
-        cleaner.encode_into(piece.as_str(), &mut tokens);
-        had_piece = true;
-    }
+    let collapsed = SPACES_RE.replace_all(phonemes.trim(), " ");
+    cleaner.encode_into(&collapsed, &mut tokens);
     tokens
 }
 
@@ -1083,14 +1075,36 @@ fn ensure_punctuation(text: &str) -> String {
 fn chunk_text(text: &str, max_len: usize) -> Vec<String> {
     let mut chunks = Vec::new();
 
-    for part in SENTENCE_SPLIT_RE.split(text) {
-        let sentence = part.trim();
+    let mut sentences = Vec::new();
+    let mut current_sentence = String::new();
+    let mut in_punct = false;
+
+    for c in text.chars() {
+        let is_punct = c == '.' || c == '!' || c == '?';
+        if is_punct {
+            current_sentence.push(c);
+            in_punct = true;
+        } else {
+            if in_punct {
+                sentences.push(current_sentence.trim().to_string());
+                current_sentence.clear();
+                in_punct = false;
+            }
+            current_sentence.push(c);
+        }
+    }
+    let final_sentence = current_sentence.trim();
+    if !final_sentence.is_empty() {
+        sentences.push(final_sentence.to_string());
+    }
+
+    for sentence in sentences {
         if sentence.is_empty() {
             continue;
         }
 
         if sentence.len() <= max_len {
-            chunks.push(ensure_punctuation(sentence));
+            chunks.push(ensure_punctuation(&sentence));
             continue;
         }
 
@@ -1722,6 +1736,34 @@ mod tests {
             cuda_memory_limit: None,
         };
         assert_eq!(selection.resolve_repo_id(), "KittenML/custom");
+    }
+
+    #[test]
+    fn test_tokenize_phonemes_spacing() {
+        let cleaner = TextCleaner::new();
+        let phonemes = "hɛloʊ, wɜːld.";
+        let tokens = tokenize_phonemes(&cleaner, phonemes);
+
+        let mut decoded = String::new();
+        let reverse_map: std::collections::HashMap<i64, char> = cleaner
+            .word_index_dictionary
+            .iter()
+            .map(|(&k, &v)| (v, k))
+            .collect();
+        for t in tokens {
+            if let Some(c) = reverse_map.get(&t) {
+                decoded.push(*c);
+            }
+        }
+        assert_eq!(decoded, "hɛloʊ, wɜːld."); // This will fail if it injects spaces
+    }
+
+    #[test]
+    fn chunking_retains_punctuation() {
+        let text = "Hello world! How are you?";
+        let chunks = chunk_text(text, 50);
+        // This test will fail if punctuation is lost and replaced with commas.
+        assert_eq!(chunks, vec!["Hello world!", "How are you?"]);
     }
 
     #[test]
