@@ -63,8 +63,8 @@ enum Commands {
     Models(ModelsCommandTop),
 }
 
-#[derive(Debug, Args)]
-struct SynthesizeArgs {
+#[derive(Debug, Clone, Args)]
+struct SynthesisArgs {
     #[command(flatten)]
     model: ModelSelection,
     #[command(flatten)]
@@ -88,6 +88,12 @@ struct SynthesizeArgs {
     seed: Option<u64>,
     #[arg(long, value_enum, default_value_t = PhonemizerMode::EspeakNg)]
     phonemizer: PhonemizerMode,
+}
+
+#[derive(Debug, Args)]
+struct SynthesizeArgs {
+    #[command(flatten)]
+    synthesis: SynthesisArgs,
     #[arg(long, default_value = "output.wav")]
     output: PathBuf,
     #[arg(long, value_enum, default_value_t = WavEncoding::Pcm16)]
@@ -97,55 +103,13 @@ struct SynthesizeArgs {
 #[derive(Debug, Args)]
 struct StreamArgs {
     #[command(flatten)]
-    model: ModelSelection,
-    #[command(flatten)]
-    text: TextInput,
-    #[arg(
-        long,
-        help = "Voice name/alias. If omitted, pick a random available voice"
-    )]
-    voice: Option<String>,
-    #[arg(long, default_value_t = 1.0)]
-    speed: f32,
-    #[arg(long, default_value_t = DEFAULT_SAMPLE_RATE)]
-    sample_rate: u32,
-    #[arg(long, default_value_t = DEFAULT_MAX_CHARS)]
-    max_chars: usize,
-    #[arg(long, default_value_t = DEFAULT_TRIM_TAIL)]
-    trim_tail: usize,
-    #[arg(long)]
-    style_index: Option<usize>,
-    #[arg(long, help = "Random seed for reproducible voice/style selection")]
-    seed: Option<u64>,
-    #[arg(long, value_enum, default_value_t = PhonemizerMode::EspeakNg)]
-    phonemizer: PhonemizerMode,
+    synthesis: SynthesisArgs,
 }
 
 #[derive(Debug, Args)]
 struct PlayArgs {
     #[command(flatten)]
-    model: ModelSelection,
-    #[command(flatten)]
-    text: TextInput,
-    #[arg(
-        long,
-        help = "Voice name/alias. If omitted, pick a random available voice"
-    )]
-    voice: Option<String>,
-    #[arg(long, default_value_t = 1.0)]
-    speed: f32,
-    #[arg(long, default_value_t = DEFAULT_SAMPLE_RATE)]
-    sample_rate: u32,
-    #[arg(long, default_value_t = DEFAULT_MAX_CHARS)]
-    max_chars: usize,
-    #[arg(long, default_value_t = DEFAULT_TRIM_TAIL)]
-    trim_tail: usize,
-    #[arg(long)]
-    style_index: Option<usize>,
-    #[arg(long, help = "Random seed for reproducible voice/style selection")]
-    seed: Option<u64>,
-    #[arg(long, value_enum, default_value_t = PhonemizerMode::EspeakNg)]
-    phonemizer: PhonemizerMode,
+    synthesis: SynthesisArgs,
     #[arg(long, value_enum, default_value_t = PlayerMode::Auto)]
     player: PlayerMode,
     #[arg(
@@ -650,6 +614,18 @@ struct SynthesisConfig {
     trim_tail: usize,
     style_index: Option<usize>,
     seed: Option<u64>,
+}
+
+impl From<&SynthesisArgs> for SynthesisConfig {
+    fn from(args: &SynthesisArgs) -> Self {
+        Self {
+            speed: args.speed,
+            max_chars: args.max_chars,
+            trim_tail: args.trim_tail,
+            style_index: args.style_index,
+            seed: args.seed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1523,18 +1499,16 @@ fn build_http_client() -> Result<Client> {
 }
 
 fn prepare_synthesis_runtime(
-    model: &ModelSelection,
-    text_input: &TextInput,
-    phonemizer_mode: PhonemizerMode,
+    args: &SynthesisArgs,
 ) -> Result<(String, Synthesizer, Box<dyn Phonemizer>)> {
-    let text = read_text_input(text_input)?;
+    let text = read_text_input(&args.text)?;
     let client = build_http_client()?;
-    let cache_root = model.resolve_cache_dir()?;
-    let repo_id = model.resolve_repo_id();
-    let ort_runtime = model.resolve_ort_runtime_config();
+    let cache_root = args.model.resolve_cache_dir()?;
+    let repo_id = args.model.resolve_repo_id();
+    let ort_runtime = args.model.resolve_ort_runtime_config();
     let artifacts = ensure_model_cached(&client, &cache_root, &repo_id, false)?;
     let synthesizer = Synthesizer::new(&artifacts, &ort_runtime)?;
-    let phonemizer = detect_phonemizer(phonemizer_mode)?;
+    let phonemizer = detect_phonemizer(args.phonemizer)?;
     Ok((text, synthesizer, phonemizer))
 }
 
@@ -1609,67 +1583,51 @@ fn main() -> Result<()> {
             }
         }
         Commands::Play(args) => {
-            let (text, mut synthesizer, phonemizer) =
-                prepare_synthesis_runtime(&args.model, &args.text, args.phonemizer)?;
-            let config = SynthesisConfig {
-                speed: args.speed,
-                max_chars: args.max_chars,
-                trim_tail: args.trim_tail,
-                style_index: args.style_index,
-                seed: args.seed,
-            };
+            let (text, mut synthesizer, phonemizer) = prepare_synthesis_runtime(&args.synthesis)?;
+            let config = SynthesisConfig::from(&args.synthesis);
 
             let audio = synthesizer.synthesize(
                 &text,
-                args.voice.as_deref(),
+                args.synthesis.voice.as_deref(),
                 config,
                 phonemizer.as_ref(),
             )?;
             play_audio(
                 &audio,
-                args.sample_rate,
+                args.synthesis.sample_rate,
                 args.player,
                 args.gain,
                 args.allow_clipping,
             )?;
         }
         Commands::Synthesize(args) => {
-            let (text, mut synthesizer, phonemizer) =
-                prepare_synthesis_runtime(&args.model, &args.text, args.phonemizer)?;
-            let config = SynthesisConfig {
-                speed: args.speed,
-                max_chars: args.max_chars,
-                trim_tail: args.trim_tail,
-                style_index: args.style_index,
-                seed: args.seed,
-            };
+            let (text, mut synthesizer, phonemizer) = prepare_synthesis_runtime(&args.synthesis)?;
+            let config = SynthesisConfig::from(&args.synthesis);
 
             let audio = synthesizer.synthesize(
                 &text,
-                args.voice.as_deref(),
+                args.synthesis.voice.as_deref(),
                 config,
                 phonemizer.as_ref(),
             )?;
 
-            write_wav(&args.output, args.sample_rate, args.wav_encoding, &audio)?;
+            write_wav(
+                &args.output,
+                args.synthesis.sample_rate,
+                args.wav_encoding,
+                &audio,
+            )?;
             eprintln!("wrote {} samples to {}", audio.len(), args.output.display());
         }
         Commands::Stream(args) => {
-            let (text, mut synthesizer, phonemizer) =
-                prepare_synthesis_runtime(&args.model, &args.text, args.phonemizer)?;
-            let config = SynthesisConfig {
-                speed: args.speed,
-                max_chars: args.max_chars,
-                trim_tail: args.trim_tail,
-                style_index: args.style_index,
-                seed: args.seed,
-            };
+            let (text, mut synthesizer, phonemizer) = prepare_synthesis_runtime(&args.synthesis)?;
+            let config = SynthesisConfig::from(&args.synthesis);
 
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
             synthesizer.synthesize_streaming(
                 &text,
-                args.voice.as_deref(),
+                args.synthesis.voice.as_deref(),
                 config,
                 phonemizer.as_ref(),
                 |chunk| {
