@@ -42,7 +42,9 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.30
         with:
           cuda: '12.2.2'
-          sub-packages: '["cudart", "cublas", "cufft", "curand", "nvrtc"]'
+          method: 'network'
+          non-cuda-sub-packages: '["libcublas", "libcufft", "libcurand", "libnvrtc"]'
+          sub-packages: '["cudart"]'
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -94,7 +96,7 @@ jobs:
           mkdir -p dist
           archive="kitten-tts-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive_ext }}"
           cd target/${{ matrix.target }}/release
-          tar -czf "../../../dist/${archive}" ${{ matrix.bin_name }} libonnxruntime* libcublasLt.so.12 libcublas.so.12 libcudart.so.12 libcufft.so.11 libcurand.so.10 libnvrtc.so.12
+          tar -czf "../../../dist/${archive}" ${{ matrix.bin_name }} libonnxruntime* libcublasLt.so.12 libcublas.so.12 libcudart.so.12 libcufft.so.11 libcurand.so.11 libnvrtc.so.12
 
       - name: Package artifact (macOS)
         if: runner.os == 'macOS'
