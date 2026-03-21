@@ -39,7 +39,7 @@ jobs:
 
       - name: Install CUDA 12.2 (Linux)
         if: runner.os == 'Linux'
-        uses: Jimver/cuda-toolkit@v0.0.6
+        uses: Jimver/cuda-toolkit@v0.2.30
         with:
           cuda: '12.2.2'
           subpackages: '["cudart", "cublas", "cufft", "curand", "nvrtc"]'
