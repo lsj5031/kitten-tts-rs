@@ -983,6 +983,41 @@ fn check_gpu_vram(device_id: i32, arena_mib: u64) -> Result<()> {
     Ok(())
 }
 
+fn resolve_ort_lib(config: &OrtRuntimeConfig) -> PathBuf {
+    // Priority order:
+    // 1. --ort-lib CLI argument
+    // 2. ORT_DYLIB_PATH environment variable
+    // 3. Bundled next to executable (for releases)
+    // 4. System library search (for existing installations)
+
+    if let Some(ref lib) = config.ort_lib {
+        return lib.clone();
+    }
+
+    if let Some(path) = std::env::var_os("ORT_DYLIB_PATH").map(PathBuf::from) {
+        return path;
+    }
+
+    #[cfg(target_os = "windows")]
+    let lib = "onnxruntime.dll";
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let lib = "libonnxruntime.so";
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let lib = "libonnxruntime.dylib";
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        let mut bundled = exe_path;
+        bundled.pop();
+        bundled.push(lib);
+        if bundled.exists() {
+            return bundled;
+        }
+    }
+
+    // Fall back to system library (let dynamic linker find it)
+    PathBuf::from(lib)
+}
+
 fn init_ort(config: &OrtRuntimeConfig) -> Result<()> {
     ORT_INIT.get_or_try_init(|| -> Result<()> {
         if config.cuda_lib_dir.is_some() || config.cudnn_lib_dir.is_some() {
@@ -991,21 +1026,19 @@ fn init_ort(config: &OrtRuntimeConfig) -> Result<()> {
                 config.cudnn_lib_dir.as_deref(),
             )
             .context("failed preloading CUDA/cuDNN shared libraries")?;
+        } else if config.ort_lib.is_none() {
+            // Auto-preload bundled CUDA libraries when no explicit paths provided
+            if let Ok(exe_path) = std::env::current_exe() {
+                let mut cuda_dir = exe_path;
+                cuda_dir.pop();
+                if cuda_dir.join("libcublasLt.so.12").exists() {
+                    ep::cuda::preload_dylibs(Some(cuda_dir.as_path()), None)
+                        .context("failed preloading bundled CUDA libraries")?;
+                }
+            }
         }
 
-        let ort_lib = config
-            .ort_lib
-            .clone()
-            .or_else(|| std::env::var_os("ORT_DYLIB_PATH").map(PathBuf::from))
-            .unwrap_or_else(|| {
-                #[cfg(target_os = "windows")]
-                let lib = "onnxruntime.dll";
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                let lib = "libonnxruntime.so";
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
-                let lib = "libonnxruntime.dylib";
-                PathBuf::from(lib)
-            });
+        let ort_lib = resolve_ort_lib(config);
 
         let _ = ort::init_from(&ort_lib)
             .with_context(|| {

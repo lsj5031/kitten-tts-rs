@@ -40,12 +40,71 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package artifact (Unix)
-        if: runner.os != 'Windows'
+      - name: Install CUDA 12 runtime (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # Install CUDA 12 runtime libraries required by ONNX Runtime 1.23.0
+          apt-get update && apt-get install -y --no-install-recommends \
+            cuda-runtime-12-8 \
+            libcublas-12-8 \
+            libcufft-11-8 \
+            libcurand-11-8 \
+            libnvrtc-12-8 \
+            libnvjitlink-12-8 \
+          || apt-get install -y --no-install-recommends \
+            cuda-toolkit-12-8
+
+      - name: Download and unpack ONNX Runtime (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -LO https://github.com/microsoft/onnxruntime/releases/download/v1.23.0/onnxruntime-linux-x64-gpu-1.23.0.tgz
+          tar -xzf onnxruntime-linux-x64-gpu-1.23.0.tgz
+          cp -P onnxruntime-linux-x64-gpu-1.23.0/lib/libonnxruntime*.so* target/${{ matrix.target }}/release/
+          cp -P onnxruntime-linux-x64-gpu-1.23.0/lib/libonnxruntime_providers_*.so target/${{ matrix.target }}/release/
+
+      - name: Copy CUDA 12 runtime libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # Find and copy CUDA 12 libraries needed by ONNX Runtime
+          for lib in libcublasLt.so.12 libcublas.so.12 libcudart.so.12 libcufft.so.11 libcurand.so.10 libnvrtc.so.12; do
+            path="$(find /usr -name "$lib" -type f 2>/dev/null | head -1)"
+            if [ -z "$path" ]; then
+              echo "::error::Missing required CUDA runtime library: $lib"
+              exit 1
+            fi
+            cp -P "$path" "target/${{ matrix.target }}/release/"
+          done
+
+      - name: Download and unpack ONNX Runtime (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          curl -LO https://github.com/microsoft/onnxruntime/releases/download/v1.23.0/onnxruntime-osx-arm64-1.23.0.tgz
+          tar -xzf onnxruntime-osx-arm64-1.23.0.tgz
+          cp -P onnxruntime-osx-arm64-1.23.0/lib/libonnxruntime*.dylib target/${{ matrix.target }}/release/
+
+      - name: Download and unpack ONNX Runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.23.0/onnxruntime-win-x64-gpu-1.23.0.zip" -OutFile "onnxruntime.zip"
+          Expand-Archive -Path "onnxruntime.zip" -DestinationPath "onnxruntime"
+          Copy-Item -Path "onnxruntime\onnxruntime-win-x64-gpu-1.23.0\lib\*.dll" -Destination "target/${{ matrix.target }}/release/"
+
+      - name: Package artifact (Linux)
+        if: runner.os == 'Linux'
         run: |
           mkdir -p dist
           archive="kitten-tts-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive_ext }}"
-          tar -C "target/${{ matrix.target }}/release" -czf "dist/${archive}" "${{ matrix.bin_name }}"
+          cd target/${{ matrix.target }}/release
+          tar -czf "../../../dist/${archive}" ${{ matrix.bin_name }} libonnxruntime* libcublasLt.so.12 libcublas.so.12 libcudart.so.12 libcufft.so.11 libcurand.so.10 libnvrtc.so.12
+
+      - name: Package artifact (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist
+          archive="kitten-tts-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive_ext }}"
+          cd target/${{ matrix.target }}/release
+          tar -czf "../../../dist/${archive}" ${{ matrix.bin_name }} libonnxruntime*.dylib
 
       - name: Package artifact (Windows)
         if: runner.os == 'Windows'
@@ -53,7 +112,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           $archive = "kitten-tts-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive_ext }}"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" -DestinationPath "dist/$archive" -Force
+          $files = Get-ChildItem -Path "target/${{ matrix.target }}/release" -Include "${{ matrix.bin_name }}", "*.dll" -Recurse
+          Compress-Archive -Path $files -DestinationPath "dist/$archive" -Force
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
