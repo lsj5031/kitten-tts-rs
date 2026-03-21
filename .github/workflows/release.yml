@@ -53,7 +53,7 @@ jobs:
           # Using runfile and extracting only the runtime libraries we need
           curl -sL https://developer.download.nvidia.com/compute/cuda/12.2.2/local_installers/cuda_12.2.2_535.104.05_linux.run -o cuda.run
           mkdir -p cuda-libs
-          sh cuda.run --extract=cuda-libs --silent --override
+          sh cuda.run --extract=cuda-libs --silent
 
           # Copy CUDA runtime libraries to release bundle
           # These are the libraries ONNX Runtime GPU needs
