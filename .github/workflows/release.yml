@@ -37,14 +37,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install CUDA 12.2 (Linux)
+      - name: Install CUDA runtime libraries (Linux)
         if: runner.os == 'Linux'
-        uses: Jimver/cuda-toolkit@v0.2.30
-        with:
-          cuda: '12.2.2'
-          method: 'network'
-          non-cuda-sub-packages: '["libcublas", "libcufft", "libcurand", "libnvrtc"]'
-          sub-packages: '["cudart"]'
+        run: |
+          wget -qO- https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/3bf863cc.pub \
+            | sudo gpg --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/ /" \
+            | sudo tee /etc/apt/sources.list.d/cuda.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-cudart-12-8 libcublas-12-8 libcufft-12-8 libcurand-12-8 libnvrtc-12-8
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
