@@ -37,7 +37,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install CUDA runtime libraries (Linux)
+      - name: Install CUDA/cuDNN runtime libraries (Linux)
         if: runner.os == 'Linux'
         run: |
           wget -qO- https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/3bf863cc.pub \
@@ -46,7 +46,8 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/cuda.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cuda-cudart-12-8 libcublas-12-8 libcufft-12-8 libcurand-12-8 cuda-nvrtc-12-8
+            cuda-cudart-12-8 libcublas-12-8 libcufft-12-8 libcurand-12-8 cuda-nvrtc-12-8 \
+            libcudnn9-cuda-12
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -60,22 +61,33 @@ jobs:
           cp -P onnxruntime-linux-x64-gpu-1.23.0/lib/libonnxruntime*.so* target/${{ matrix.target }}/release/
           cp -P onnxruntime-linux-x64-gpu-1.23.0/lib/libonnxruntime_providers_*.so target/${{ matrix.target }}/release/
 
-      - name: Copy CUDA runtime libraries (Linux)
+      - name: Copy CUDA/cuDNN runtime libraries (Linux)
         if: runner.os == 'Linux'
         run: |
-          # Copy CUDA runtime libraries from system installation to release bundle
-          for lib in libcublasLt.so.12 libcublas.so.12 libcudart.so.12 libcufft.so.11 libcurand.so.11 libnvrtc.so.12; do
-            path="$(find /usr/local/cuda -name "$lib" -type f 2>/dev/null | head -1)"
-            if [ -z "$path" ]; then
-              # Fallback to system search
-              path="$(find /usr -name "$lib" -type f 2>/dev/null | head -1)"
-            fi
-            if [ -z "$path" ]; then
-              echo "::error::Missing required CUDA runtime library: $lib"
+          set -euo pipefail
+          out="target/${{ matrix.target }}/release"
+
+          copy_pkg_files() {
+            local pkg=$1
+            local regex=$2
+            mapfile -t files < <(dpkg-query -L "$pkg" | grep -E "$regex" || true)
+            if [ ${#files[@]} -eq 0 ]; then
+              echo "::error::No files matched $regex in package $pkg"
               exit 1
             fi
-            cp -P "$path" "target/${{ matrix.target }}/release/"
-          done
+            cp -a "${files[@]}" "$out/"
+          }
+
+          # Query installed packages directly so we copy both soname symlinks and
+          # fully versioned targets instead of relying on brittle filesystem scans.
+          copy_pkg_files libcublas-12-8 '/libcublasLt\.so\.12(\..*)?$'
+          copy_pkg_files libcublas-12-8 '/libcublas\.so\.12(\..*)?$'
+          copy_pkg_files cuda-cudart-12-8 '/libcudart\.so\.12(\..*)?$'
+          copy_pkg_files libcufft-12-8 '/libcufft\.so\.11(\..*)?$'
+          copy_pkg_files libcurand-12-8 '/libcurand\.so\.10(\..*)?$'
+          copy_pkg_files cuda-nvrtc-12-8 '/libnvrtc\.so(\.12(\..*)?)?$'
+          copy_pkg_files cuda-nvrtc-12-8 '/libnvrtc-builtins\.so(\.12\.8(\..*)?)?$'
+          copy_pkg_files libcudnn9-cuda-12 '/libcudnn.*\.so\.9(\..*)?$'
 
       - name: Download and unpack ONNX Runtime (macOS)
         if: runner.os == 'macOS'
@@ -92,13 +104,35 @@ jobs:
           Expand-Archive -Path "onnxruntime.zip" -DestinationPath "onnxruntime"
           Copy-Item -Path "onnxruntime\onnxruntime-win-x64-gpu-1.23.0\lib\*.dll" -Destination "target/${{ matrix.target }}/release/"
 
+      - name: Validate Linux bundle
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          rel="$PWD/target/${{ matrix.target }}/release"
+          # ldd catches missing ORT/CUDA/cuDNN dynamic deps, but NVRTC builtins are
+          # loaded internally, so they still need to be copied explicitly above.
+          LD_LIBRARY_PATH="$rel" ldd "$rel/libonnxruntime_providers_cuda.so" | tee /tmp/ldd.txt
+          ! grep -q 'not found' /tmp/ldd.txt
+
       - name: Package artifact (Linux)
         if: runner.os == 'Linux'
         run: |
-          mkdir -p dist
+          set -euo pipefail
+          rm -rf bundle
+          mkdir -p dist bundle
           archive="kitten-tts-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive_ext }}"
-          cd target/${{ matrix.target }}/release
-          tar -czf "../../../dist/${archive}" ${{ matrix.bin_name }} libonnxruntime* libcublasLt.so.12 libcublas.so.12 libcudart.so.12 libcufft.so.11 libcurand.so.11 libnvrtc.so.12
+          rel="target/${{ matrix.target }}/release"
+
+          cp "$rel/${{ matrix.bin_name }}" bundle/
+          cp -a "$rel"/libonnxruntime* bundle/
+          cp -a "$rel"/libcublas* bundle/ || true
+          cp -a "$rel"/libcudart* bundle/ || true
+          cp -a "$rel"/libcufft* bundle/ || true
+          cp -a "$rel"/libcurand* bundle/ || true
+          cp -a "$rel"/libnvrtc* bundle/ || true
+          cp -a "$rel"/libcudnn* bundle/ || true
+
+          tar -C bundle -czf "dist/${archive}" .
 
       - name: Package artifact (macOS)
         if: runner.os == 'macOS'
