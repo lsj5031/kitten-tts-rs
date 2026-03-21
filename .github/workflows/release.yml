@@ -42,7 +42,7 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.30
         with:
           cuda: '12.2.2'
-          subpackages: '["cudart", "cublas", "cufft", "curand", "nvrtc"]'
+          sub-packages: '["cudart", "cublas", "cufft", "curand", "nvrtc"]'
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
