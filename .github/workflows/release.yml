@@ -40,33 +40,31 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Install CUDA 12 runtime (Linux)
+      - name: Download and unpack ONNX Runtime + CUDA libraries (Linux)
         if: runner.os == 'Linux'
         run: |
-          # Install CUDA 12 runtime libraries required by ONNX Runtime 1.23.0
-          apt-get update && apt-get install -y --no-install-recommends \
-            cuda-runtime-12-8 \
-            libcublas-12-8 \
-            libcufft-11-8 \
-            libcurand-11-8 \
-            libnvrtc-12-8 \
-            libnvjitlink-12-8 \
-          || apt-get install -y --no-install-recommends \
-            cuda-toolkit-12-8
-
-      - name: Download and unpack ONNX Runtime (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          curl -LO https://github.com/microsoft/onnxruntime/releases/download/v1.23.0/onnxruntime-linux-x64-gpu-1.23.0.tgz
+          # Download ONNX Runtime GPU build
+          curl -sLO https://github.com/microsoft/onnxruntime/releases/download/v1.23.0/onnxruntime-linux-x64-gpu-1.23.0.tgz
           tar -xzf onnxruntime-linux-x64-gpu-1.23.0.tgz
           cp -P onnxruntime-linux-x64-gpu-1.23.0/lib/libonnxruntime*.so* target/${{ matrix.target }}/release/
           cp -P onnxruntime-linux-x64-gpu-1.23.0/lib/libonnxruntime_providers_*.so target/${{ matrix.target }}/release/
 
-      - name: Copy CUDA 12 runtime libraries (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          # Find and copy CUDA 12 libraries needed by ONNX Runtime
-          for lib in libcublasLt.so.12 libcublas.so.12 libcudart.so.12 libcufft.so.11 libcurand.so.10 libnvrtc.so.12; do
+          # Download CUDA 12 runtime libraries from NVIDIA
+          # Using CUDA 12.2 repo package which contains all required libs
+          curl -sLO https://developer.download.nvidia.com/compute/cuda/12.2.2/local_installers/cuda-repo-linux-x86_64-12-2-12.2.2-535.104.05-1_1.0-1_amd64.deb
+          sudo dpkg -i cuda-repo-linux-x86_64-12-2-12.2.2-535.104.05-1_1.0-1_amd64.deb
+          sudo cp /var/cuda-repo-12-2-12.2.2-535.104.05-1/cuda-*-keyring.gpg /usr/share/keyrings/
+          echo "deb [signed-by=/usr/share/keyrings/cuda-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/ /" | sudo tee /etc/apt/sources.list.d/cuda.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-cudart-12-2 \
+            libcublas-12-2 \
+            libcufft-11-2 \
+            libcurand-11-2 \
+            libnvrtc-12-2
+
+          # Copy CUDA libraries to release bundle
+          for lib in libcublasLt.so.12 libcublas.so.12 libcudart.so.12 libcufft.so.11 libcurand.so.11 libnvrtc.so.12; do
             path="$(find /usr -name "$lib" -type f 2>/dev/null | head -1)"
             if [ -z "$path" ]; then
               echo "::error::Missing required CUDA runtime library: $lib"

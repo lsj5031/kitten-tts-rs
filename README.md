@@ -44,6 +44,14 @@ kitten-tts play \
 
 ## Install
 
+### Pre-built Releases
+
+Linux/macOS/Windows releases are available on the [GitHub Releases](https://github.com/lsj5031/kitten-tts-rs/releases) page.
+
+Linux releases include bundled CUDA 12.2 runtime libraries (libcublasLt.so.12, libcublas.so.12, libcudart.so.12, libcufft.so.11, libcurand.so.11, libnvrtc.so.12) alongside the ONNX Runtime GPU build, so no separate CUDA installation is needed when using the binary.
+
+### Build from Source
+
 Build locally:
 
 ```bash
