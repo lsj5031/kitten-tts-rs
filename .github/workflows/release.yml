@@ -49,29 +49,20 @@ jobs:
           cp -P onnxruntime-linux-x64-gpu-1.23.0/lib/libonnxruntime*.so* target/${{ matrix.target }}/release/
           cp -P onnxruntime-linux-x64-gpu-1.23.0/lib/libonnxruntime_providers_*.so target/${{ matrix.target }}/release/
 
-          # Download CUDA 12 runtime libraries from NVIDIA
-          # Using CUDA 12.2 repo package which contains all required libs
-          curl -sL https://developer.download.nvidia.com/compute/cuda/12.2.2/local_installers/cuda-repo-linux-x86_64-12-2-12.2.2-535.104.05-1_1.0-1_amd64.deb -o cuda-repo.deb
-          sudo dpkg -i cuda-repo.deb
-          sudo cp /var/cuda-repo-12-2-12.2.2-535.104.05-1/cuda-*-keyring.gpg /usr/share/keyrings/
-          echo "deb [signed-by=/usr/share/keyrings/cuda-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/ /" | sudo tee /etc/apt/sources.list.d/cuda.list
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cuda-cudart-12-2 \
-            libcublas-12-2 \
-            libcufft-11-2 \
-            libcurand-11-2 \
-            libnvrtc-12-2
+          # Download CUDA 12.2 runtime libraries from NVIDIA runfile
+          # Using runfile and extracting only the runtime libraries we need
+          curl -sL https://developer.download.nvidia.com/compute/cuda/12.2.2/local_installers/cuda_12.2.2_535.104.05_linux.run -o cuda.run
+          mkdir -p cuda-libs
+          sh cuda.run --extract=cuda-libs --silent --override
 
-          # Copy CUDA libraries to release bundle
-          for lib in libcublasLt.so.12 libcublas.so.12 libcudart.so.12 libcufft.so.11 libcurand.so.11 libnvrtc.so.12; do
-            path="$(find /usr -name "$lib" -type f 2>/dev/null | head -1)"
-            if [ -z "$path" ]; then
-              echo "::error::Missing required CUDA runtime library: $lib"
-              exit 1
-            fi
-            cp -P "$path" "target/${{ matrix.target }}/release/"
-          done
+          # Copy CUDA runtime libraries to release bundle
+          # These are the libraries ONNX Runtime GPU needs
+          cp -P cuda-libs/cuda/lib64/libcublasLt.so.12* target/${{ matrix.target }}/release/
+          cp -P cuda-libs/cuda/lib64/libcublas.so.12* target/${{ matrix.target }}/release/
+          cp -P cuda-libs/cuda/lib64/libcudart.so.12* target/${{ matrix.target }}/release/
+          cp -P cuda-libs/cuda/lib64/libcufft.so.11* target/${{ matrix.target }}/release/
+          cp -P cuda-libs/cuda/lib64/libcurand.so.11* target/${{ matrix.target }}/release/
+          cp -P cuda-libs/cuda/lib64/libnvrtc.so.12* target/${{ matrix.target }}/release/
 
       - name: Download and unpack ONNX Runtime (macOS)
         if: runner.os == 'macOS'
