@@ -193,6 +193,124 @@ struct ModelSelection {
         help = "CUDA memory arena limit in MiB (default: 2048). Lower this on GPUs with limited VRAM to avoid driver crashes"
     )]
     cuda_memory_limit: Option<usize>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = ArenaStrategy::SameAsRequested,
+        help = "Memory arena extend strategy: same-as-requested (minimize allocation) or next-power-of-two (better performance)"
+    )]
+    arena_strategy: ArenaStrategy,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = ConvAlgo::Heuristic,
+        help = "cuDNN convolution algorithm search: heuristic (low memory) or exhaustive (better performance)"
+    )]
+    conv_algo: ConvAlgo,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = GraphOpt::Level1,
+        help = "ONNX graph optimization level: basic (1) or full (3). Higher levels may use more VRAM but optimize better"
+    )]
+    graph_opt: GraphOpt,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Enable memory pattern planning (pre-allocate buffers) for faster execution"
+    )]
+    memory_pattern: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Enable parallel execution (concurrent kernels) for potential speedup"
+    )]
+    parallel_execution: bool,
+    #[arg(
+        long,
+        value_enum,
+        help = "VRAM profile: minimal (lowest VRAM), balanced (default), performance (fastest)"
+    )]
+    vram_profile: Option<VramProfile>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum GraphOpt {
+    #[value(name = "1")]
+    Level1,
+    #[value(name = "3")]
+    Level3,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum VramProfile {
+    #[value(name = "minimal")]
+    Minimal,
+    #[value(name = "balanced")]
+    Balanced,
+    #[value(name = "performance")]
+    Performance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ArenaStrategy {
+    #[value(name = "same-as-requested")]
+    SameAsRequested,
+    #[value(name = "next-power-of-two")]
+    NextPowerOfTwo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ConvAlgo {
+    #[value(name = "heuristic")]
+    Heuristic,
+    #[value(name = "default")]
+    Default,
+    #[value(name = "exhaustive")]
+    Exhaustive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedSessionConfig {
+    arena_strategy: ArenaStrategy,
+    conv_algo: ConvAlgo,
+    graph_opt: GraphOpt,
+    memory_pattern: bool,
+    parallel_execution: bool,
+    inter_threads: usize,
+}
+
+fn resolve_session_config(cfg: &OrtRuntimeConfig) -> ResolvedSessionConfig {
+    match cfg.vram_profile {
+        Some(VramProfile::Minimal) => ResolvedSessionConfig {
+            arena_strategy: ArenaStrategy::SameAsRequested,
+            conv_algo: ConvAlgo::Heuristic,
+            graph_opt: GraphOpt::Level1,
+            memory_pattern: false,
+            parallel_execution: false,
+            inter_threads: SAFE_INTER_THREADS,
+        },
+        Some(VramProfile::Performance) => ResolvedSessionConfig {
+            arena_strategy: ArenaStrategy::NextPowerOfTwo,
+            conv_algo: ConvAlgo::Exhaustive,
+            graph_opt: GraphOpt::Level3,
+            memory_pattern: true,
+            parallel_execution: true,
+            inter_threads: 0, // let ORT decide
+        },
+        Some(VramProfile::Balanced) | None => ResolvedSessionConfig {
+            arena_strategy: cfg.arena_strategy,
+            conv_algo: cfg.conv_algo,
+            graph_opt: cfg.graph_opt,
+            memory_pattern: cfg.memory_pattern,
+            parallel_execution: cfg.parallel_execution,
+            inter_threads: if cfg.parallel_execution {
+                0
+            } else {
+                SAFE_INTER_THREADS
+            },
+        },
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +320,12 @@ struct OrtRuntimeConfig {
     cudnn_lib_dir: Option<PathBuf>,
     cuda_device_id: i32,
     cuda_memory_limit_bytes: usize,
+    arena_strategy: ArenaStrategy,
+    conv_algo: ConvAlgo,
+    graph_opt: GraphOpt,
+    memory_pattern: bool,
+    parallel_execution: bool,
+    vram_profile: Option<VramProfile>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -294,6 +418,12 @@ impl ModelSelection {
                 .cuda_memory_limit
                 .map(|mib| mib * 1024 * 1024)
                 .unwrap_or(DEFAULT_CUDA_MEMORY_LIMIT_BYTES),
+            arena_strategy: self.arena_strategy,
+            conv_algo: self.conv_algo,
+            graph_opt: self.graph_opt,
+            memory_pattern: self.memory_pattern,
+            parallel_execution: self.parallel_execution,
+            vram_profile: self.vram_profile,
         }
     }
 }
@@ -669,22 +799,52 @@ impl Synthesizer {
         let arena_mib = (ort_runtime.cuda_memory_limit_bytes / (1024 * 1024)) as u64;
         check_gpu_vram(ort_runtime.cuda_device_id, arena_mib)?;
 
+        let resolved = resolve_session_config(ort_runtime);
+
+        if let Some(profile) = ort_runtime.vram_profile {
+            eprintln!("[VRAM Profile] {:?}", profile);
+        }
+        eprintln!(
+            "[Session] arena={:?}, conv={:?}, graph_opt={:?}, mem_pattern={}, parallel={}, inter_threads={}",
+            resolved.arena_strategy,
+            resolved.conv_algo,
+            resolved.graph_opt,
+            resolved.memory_pattern,
+            resolved.parallel_execution,
+            resolved.inter_threads,
+        );
+
+        let arena_strategy = match resolved.arena_strategy {
+            ArenaStrategy::SameAsRequested => ort::ep::ArenaExtendStrategy::SameAsRequested,
+            ArenaStrategy::NextPowerOfTwo => ort::ep::ArenaExtendStrategy::NextPowerOfTwo,
+        };
+        let conv_algo = match resolved.conv_algo {
+            ConvAlgo::Heuristic => ep::cuda::ConvAlgorithmSearch::Heuristic,
+            ConvAlgo::Default => ep::cuda::ConvAlgorithmSearch::Default,
+            ConvAlgo::Exhaustive => ep::cuda::ConvAlgorithmSearch::Exhaustive,
+        };
+        let graph_opt_level = match resolved.graph_opt {
+            GraphOpt::Level1 => GraphOptimizationLevel::Level1,
+            GraphOpt::Level3 => GraphOptimizationLevel::All,
+        };
+
         let cuda_ep = ep::CUDA::default()
             .with_device_id(ort_runtime.cuda_device_id)
             .with_memory_limit(ort_runtime.cuda_memory_limit_bytes)
-            .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Heuristic)
+            .with_conv_algorithm_search(conv_algo)
             .with_conv_max_workspace(false)
+            .with_arena_extend_strategy(arena_strategy)
             .build()
             .error_on_failure();
 
         let session_builder = Session::builder()?
             .with_no_environment_execution_providers()?
-            .with_parallel_execution(false)?
+            .with_parallel_execution(resolved.parallel_execution)?
             .with_intra_threads(SAFE_INTRA_THREADS)?
-            .with_inter_threads(SAFE_INTER_THREADS)?
+            .with_inter_threads(resolved.inter_threads)?
             .with_intra_op_spinning(false)?
             .with_inter_op_spinning(false)?
-            .with_memory_pattern(false)?
+            .with_memory_pattern(resolved.memory_pattern)?
             .with_deterministic_compute(true)?;
 
         let session = session_builder
@@ -692,7 +852,7 @@ impl Synthesizer {
             .context(
                 "failed enabling CUDA execution provider (GPU is required; ensure CUDA 12 + cuDNN runtime libraries are installed)",
             )?
-            .with_optimization_level(GraphOptimizationLevel::Level1)?
+            .with_optimization_level(graph_opt_level)?
             .commit_from_file(&artifacts.model_path)
             .with_context(|| {
                 format!(
@@ -1710,6 +1870,12 @@ mod tests {
             cudnn_lib_dir: None,
             cuda_device_id: None,
             cuda_memory_limit: None,
+            arena_strategy: ArenaStrategy::SameAsRequested,
+            conv_algo: ConvAlgo::Heuristic,
+            graph_opt: GraphOpt::Level1,
+            memory_pattern: false,
+            parallel_execution: false,
+            vram_profile: None,
         };
         assert_eq!(selection.resolve_repo_id(), DEFAULT_REPO_ID);
     }
@@ -1725,6 +1891,12 @@ mod tests {
             cudnn_lib_dir: None,
             cuda_device_id: None,
             cuda_memory_limit: None,
+            arena_strategy: ArenaStrategy::SameAsRequested,
+            conv_algo: ConvAlgo::Heuristic,
+            graph_opt: GraphOpt::Level1,
+            memory_pattern: false,
+            parallel_execution: false,
+            vram_profile: None,
         };
         assert_eq!(selection.resolve_repo_id(), "KittenML/custom");
     }
@@ -1848,5 +2020,85 @@ mod tests {
         assert_eq!(applied, 2.0);
         assert!((scaled[0] - 1.0).abs() < 1e-6);
         assert!((scaled[1] + 0.5).abs() < 1e-6);
+    }
+
+    fn default_ort_config() -> OrtRuntimeConfig {
+        OrtRuntimeConfig {
+            ort_lib: None,
+            cuda_lib_dir: None,
+            cudnn_lib_dir: None,
+            cuda_device_id: DEFAULT_CUDA_DEVICE_ID,
+            cuda_memory_limit_bytes: DEFAULT_CUDA_MEMORY_LIMIT_BYTES,
+            arena_strategy: ArenaStrategy::SameAsRequested,
+            conv_algo: ConvAlgo::Heuristic,
+            graph_opt: GraphOpt::Level1,
+            memory_pattern: false,
+            parallel_execution: false,
+            vram_profile: None,
+        }
+    }
+
+    #[test]
+    fn resolve_session_config_performance_profile_overrides_individual_flags() {
+        let mut cfg = default_ort_config();
+        cfg.vram_profile = Some(VramProfile::Performance);
+        // Individual flags are still at conservative defaults, but profile wins
+        let resolved = resolve_session_config(&cfg);
+        assert_eq!(resolved.arena_strategy, ArenaStrategy::NextPowerOfTwo);
+        assert_eq!(resolved.conv_algo, ConvAlgo::Exhaustive);
+        assert_eq!(resolved.graph_opt, GraphOpt::Level3);
+        assert!(resolved.memory_pattern);
+        assert!(resolved.parallel_execution);
+    }
+
+    #[test]
+    fn resolve_session_config_minimal_profile_forces_conservative() {
+        let mut cfg = default_ort_config();
+        cfg.vram_profile = Some(VramProfile::Minimal);
+        // Even if individual flags are aggressive, profile overrides
+        cfg.arena_strategy = ArenaStrategy::NextPowerOfTwo;
+        cfg.conv_algo = ConvAlgo::Exhaustive;
+        cfg.graph_opt = GraphOpt::Level3;
+        cfg.memory_pattern = true;
+        cfg.parallel_execution = true;
+        let resolved = resolve_session_config(&cfg);
+        assert_eq!(resolved.arena_strategy, ArenaStrategy::SameAsRequested);
+        assert_eq!(resolved.conv_algo, ConvAlgo::Heuristic);
+        assert_eq!(resolved.graph_opt, GraphOpt::Level1);
+        assert!(!resolved.memory_pattern);
+        assert!(!resolved.parallel_execution);
+        assert_eq!(resolved.inter_threads, SAFE_INTER_THREADS);
+    }
+
+    #[test]
+    fn resolve_session_config_no_profile_passes_individual_flags() {
+        let mut cfg = default_ort_config();
+        cfg.arena_strategy = ArenaStrategy::NextPowerOfTwo;
+        cfg.conv_algo = ConvAlgo::Exhaustive;
+        cfg.graph_opt = GraphOpt::Level3;
+        cfg.memory_pattern = true;
+        let resolved = resolve_session_config(&cfg);
+        assert_eq!(resolved.arena_strategy, ArenaStrategy::NextPowerOfTwo);
+        assert_eq!(resolved.conv_algo, ConvAlgo::Exhaustive);
+        assert_eq!(resolved.graph_opt, GraphOpt::Level3);
+        assert!(resolved.memory_pattern);
+    }
+
+    #[test]
+    fn resolve_session_config_parallel_enables_inter_threads() {
+        let mut cfg = default_ort_config();
+        cfg.parallel_execution = true;
+        let resolved = resolve_session_config(&cfg);
+        assert!(resolved.parallel_execution);
+        // inter_threads must be > 1 (or 0 = auto) for parallel to work
+        assert_ne!(resolved.inter_threads, SAFE_INTER_THREADS);
+    }
+
+    #[test]
+    fn resolve_session_config_no_parallel_keeps_safe_inter_threads() {
+        let cfg = default_ort_config();
+        let resolved = resolve_session_config(&cfg);
+        assert!(!resolved.parallel_execution);
+        assert_eq!(resolved.inter_threads, SAFE_INTER_THREADS);
     }
 }
