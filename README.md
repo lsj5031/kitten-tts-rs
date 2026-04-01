@@ -20,6 +20,8 @@ Fast Rust CLI for KittenTTS ONNX models.
 - Output: `output.wav` for `synthesize`
 - Playback gain (`play`): `2.5x` with anti-clipping limiter enabled
 - GPU runtime: CUDA execution provider is required; startup fails if CUDA is unavailable
+- CUDA session defaults: arena strategy `same-as-requested`, conv algo `heuristic`, graph opt level 1, memory pattern off, parallel execution off
+- VRAM profiles (`--vram-profile`): `minimal` / `balanced` / `performance` — curated presets that override individual session flags
 - ONNX Runtime is loaded dynamically from:
   - `--ort-lib /path/to/libonnxruntime.so` (preferred), or
   - `ORT_DYLIB_PATH=/path/to/libonnxruntime.so`, or
@@ -180,6 +182,57 @@ Notes:
 - `--voice` changes speaker identity.
 - `--style-index` changes tone/prosody flavor within that voice.
 - `--speed` changes speaking rate.
+
+## VRAM / Session Tuning
+
+Fine-grained control over ONNX Runtime session parameters for tuning GPU performance vs. VRAM usage.
+
+### Quick Presets
+
+Use `--vram-profile` to apply curated presets (overrides individual flags):
+
+```bash
+# Lowest VRAM usage
+kitten-tts play --text "hello" --vram-profile minimal
+
+# Default balanced behavior (same as omitting the flag)
+kitten-tts play --text "hello" --vram-profile balanced
+
+# Maximum performance (uses more VRAM)
+kitten-tts play --text "hello" --vram-profile performance
+```
+
+Profile details:
+
+| Setting | `minimal` | `balanced` | `performance` |
+|---|---|---|---|
+| Arena strategy | same-as-requested | *(individual flag)* | next-power-of-two |
+| Conv algo search | heuristic | *(individual flag)* | exhaustive |
+| Graph optimization | Level 1 | *(individual flag)* | Level 3 |
+| Memory pattern | off | *(individual flag)* | on |
+| Parallel execution | off | *(individual flag)* | on |
+
+### Individual Flags
+
+When `--vram-profile` is not set (or set to `balanced`), individual flags pass through:
+
+```bash
+kitten-tts play \
+  --text "hello" \
+  --arena-strategy next-power-of-two \
+  --conv-algo exhaustive \
+  --graph-opt 3 \
+  --memory-pattern \
+  --parallel-execution
+```
+
+Available flags:
+
+- `--arena-strategy <same-as-requested|next-power-of-two>` — Memory arena extend strategy
+- `--conv-algo <heuristic|default|exhaustive>` — cuDNN convolution algorithm search
+- `--graph-opt <1|3>` — ONNX graph optimization level (1 = basic, 3 = full)
+- `--memory-pattern` — Enable memory pattern planning (pre-allocate buffers)
+- `--parallel-execution` — Enable parallel execution (concurrent kernels)
 
 ## Model Selection
 

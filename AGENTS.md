@@ -113,8 +113,8 @@ Examples in repo:
 
 Examples:
 
-- `ModelSelection`, `PhonemizerMode`, `ModelPreset`
-- `resolve_cache_dir`, `clean_text_basic`, `resolve_style_index`
+- `ModelSelection`, `PhonemizerMode`, `ModelPreset`, `VramProfile`, `ArenaStrategy`, `ConvAlgo`, `GraphOpt`
+- `resolve_cache_dir`, `clean_text_basic`, `resolve_style_index`, `resolve_session_config`
 - `DEFAULT_REPO_ID`, `TOKEN_SPLIT_RE`, `MAX_INPUT_TOKENS`
 
 ### clap / CLI Modeling
@@ -178,16 +178,24 @@ Examples:
 - Default phonemizer: `espeak-ng`.
 - `--phonemizer auto`: tries `espeak-ng`, then `espeak` (no basic fallback).
 - Default sample rate in code is `24000`.
-- CUDA safety profile defaults:
+- CUDA / ORT session defaults (safe baseline; overridable via `--vram-profile` or individual flags):
   - Device: `0`
   - Memory arena limit: `2 GiB`
-  - cuDNN conv algorithm search: `Heuristic` (not exhaustive)
+  - Arena extend strategy: `SameAsRequested`
+  - cuDNN conv algorithm search: `Heuristic`
   - cuDNN max-workspace search: disabled
+  - Graph optimization level: `Level1`
+  - Memory pattern: disabled
+  - Parallel execution: disabled
 - Host CPU safety defaults:
   - intra-op threads: `1`
-  - inter-op threads: `1`
+  - inter-op threads: `1` (overridden to `0` = ORT auto when `--parallel-execution` is enabled)
   - intra-op spinning: disabled
   - inter-op spinning: disabled
+- VRAM profile presets (`--vram-profile minimal|balanced|performance`):
+  - `minimal`: conservative settings (lowest VRAM), overrides all individual flags
+  - `balanced`: passes individual flags through (default behavior when no profile set)
+  - `performance`: aggressive settings (fastest), overrides all individual flags, sets `inter_threads` to `0` for ORT auto
 - Runtime guardrails:
   - `speed` must remain in `[0.5, 2.0]`
   - `max_chars` must remain in `[1, 2000]`
