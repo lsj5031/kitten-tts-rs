@@ -45,6 +45,11 @@ Concretely:
 - **Explicit model prefetch.** `kitten-tts native fetch` downloads the Mini 0.8
   GGUF without synthesizing, and `models list` points at it. KittenTTS 2 weights
   remain a manual download.
+- **One-pass environment check.** `kitten-tts native doctor` verifies the
+  library (load, ABI, requested family), the eSpeak library and data paths, and
+  the model (cached or `--native-model`) in a single run, reporting every
+  failure instead of stopping at the first. It downloads nothing and exits
+  non-zero when any check fails.
 
 Decision owner: repository maintainer. Revisit this record if the audio.cpp ABI
 breaks its major version, if the Kitten ports regress, or if licensing terms

@@ -276,6 +276,25 @@ when a required symbol is missing, or when `--family` names an absent family. Th
 library path can also come from `AUDIOCPP_LIB`, then falls back to the platform
 default name (`libaudiocpp.so`, `libaudiocpp.dylib`, `audiocpp.dll`).
 
+### Native environment check
+
+`native doctor` checks everything `--engine native` needs in one pass and
+reports all problems at once instead of stopping at the first:
+
+```bash
+kitten-tts native doctor --native-lib /path/to/libaudiocpp.dylib
+kitten-tts native doctor --family kitten_tts2 --native-model ./kitten-tts2.gguf
+kitten-tts native doctor --cache-dir ./models
+```
+
+It verifies the library loads, its ABI matches, the requested family is
+registered, the eSpeak library and data directory are discoverable (only for
+`kitten_tts`), and the model exists (the cached Mini 0.8 GGUF, or
+`--native-model PATH`). Nothing is downloaded. Each line is `ok` or `FAILED`,
+the last line says whether the environment is ready, and the exit code is
+non-zero when any check fails. `--native-espeak-lib` and `--native-espeak-data`
+are accepted for explicit paths.
+
 ## Voice and Tone Control
 
 Pick voice:

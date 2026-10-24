@@ -244,7 +244,7 @@ enum ModelsCommands {
 #[derive(Debug, Args)]
 #[command(
     about = "Native audio.cpp engine: probe the library and download models",
-    long_about = "Native audio.cpp engine control. `probe` reports whether a local audio.cpp C API library works; `fetch` downloads the Mini 0.8 GGUF so `--engine native` can run offline. Neither command needs ONNX Runtime."
+    long_about = "Native audio.cpp engine control. `doctor` checks everything `--engine native` needs in one pass: the library and its ABI/families, the eSpeak runtime, and the model (cached or explicit). `probe` reports library details only; `fetch` downloads the Mini 0.8 GGUF so `--engine native` can run offline. None of these commands need ONNX Runtime."
 )]
 struct NativeCommandTop {
     #[command(subcommand)]
@@ -260,6 +260,11 @@ enum NativeCommands {
         long_about = "Download the KittenTTS Mini 0.8 GGUF used by `--engine native --model mini-0.8` into the cache directory. Re-running is cheap: an existing file is reused unless --force is passed. KittenTTS 2 weights are licensed differently and are never downloaded by this command."
     )]
     Fetch(NativeFetchArgs),
+    /// Check the library, eSpeak and cached model in one pass
+    #[command(
+        long_about = "Check the three things `--engine native` needs, reporting every problem in one run instead of failing at the first one: the audio.cpp library (load, ABI, requested family), the eSpeak runtime required by kitten_tts, and the model (the cached Mini 0.8 GGUF or a path passed with --native-model). Nothing is downloaded. Exits non-zero when a check fails."
+    )]
+    Doctor(NativeDoctorArgs),
 }
 
 #[derive(Debug, Args)]
@@ -290,6 +295,47 @@ struct NativeProbeArgs {
         help = "Fail unless this model family is available (for example kitten_tts)"
     )]
     family: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct NativeDoctorArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to the audio.cpp C API library (default: AUDIOCPP_LIB or platform library name)"
+    )]
+    native_lib: Option<PathBuf>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = NativeFamily::KittenTts,
+        help = "Model family to check the library and model for"
+    )]
+    family: NativeFamily,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Local GGUF to check instead of the cached Mini 0.8 model"
+    )]
+    native_model: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to libespeak-ng (default: auto-detect Homebrew/system paths)"
+    )]
+    native_espeak_lib: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to espeak-ng-data (default: auto-detect Homebrew/system paths)"
+    )]
+    native_espeak_data: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Cache directory (default: platform cache directory)"
+    )]
+    cache_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2426,6 +2472,169 @@ fn probe_native_runtime(args: &NativeProbeArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct NativeDoctorReport {
+    lines: Vec<String>,
+    failures: Vec<String>,
+}
+
+impl NativeDoctorReport {
+    fn ok(&mut self, section: &str, detail: String) {
+        self.lines.push(format!("{section}: ok - {detail}"));
+    }
+
+    fn failed(&mut self, section: &str, detail: String) {
+        self.lines.push(format!("{section}: FAILED - {detail}"));
+        self.failures.push(format!("{section}: {detail}"));
+    }
+}
+
+struct NativeDoctorLibrary {
+    build: String,
+    abi: (u32, u32, u32),
+    families: Vec<String>,
+}
+
+fn check_native_doctor_library(library_path: &Path) -> Result<NativeDoctorLibrary> {
+    let runtime = NativeRuntime::load(library_path)?;
+    let abi = abi_parts(unsafe { (runtime.abi_version)() });
+    let build = borrowed_string(unsafe { (runtime.build_version)() });
+    let families = runtime.families()?;
+    Ok(NativeDoctorLibrary {
+        build,
+        abi,
+        families,
+    })
+}
+
+fn check_native_doctor_model(
+    family: NativeFamily,
+    explicit: Option<&Path>,
+    cache_root: &Path,
+) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        if !path.is_file() {
+            bail!(
+                "native model '{}' does not exist or is not a file",
+                path.display()
+            );
+        }
+        return Ok(path.to_path_buf());
+    }
+
+    match family {
+        NativeFamily::KittenTts2 => bail!(
+            "KittenTTS 2 weights are not downloaded automatically; pass --native-model PATH to a local GGUF"
+        ),
+        NativeFamily::KittenTts => {
+            let path = cache_root.join("native").join(NATIVE_KITTEN_TTS_FILE);
+            if !path.is_file() {
+                bail!("cached model is missing at {}", path.display());
+            }
+            Ok(path)
+        }
+    }
+}
+
+fn doctor_native_runtime(args: &NativeDoctorArgs) -> Result<()> {
+    let family = args.family.as_str();
+    let cache_root = resolve_cache_root(args.cache_dir.as_deref())?;
+    let library_path = resolve_native_lib_path(args.native_lib.as_deref());
+    let mut report = NativeDoctorReport::default();
+
+    match check_native_doctor_library(&library_path) {
+        Ok(library) => {
+            let (major, minor, patch) = library.abi;
+            let detail = format!(
+                "audio.cpp {}, ABI {major}.{minor}.{patch}, {}",
+                library.build,
+                library_path.display()
+            );
+            if library.families.iter().any(|name| name == family) {
+                report.ok("library", format!("family {family} available; {detail}"));
+            } else {
+                report.failed(
+                    "library",
+                    format!("family {family} is not available; {detail}"),
+                );
+            }
+        }
+        Err(err) => report.failed("library", format!("{err:#}")),
+    }
+
+    if args.family == NativeFamily::KittenTts {
+        match resolve_espeak_path(
+            args.native_espeak_lib.as_deref(),
+            detect_espeak_library,
+            "libespeak-ng",
+        ) {
+            Ok(Some(path)) => report.ok("espeak lib", path.display().to_string()),
+            Ok(None) => report.failed(
+                "espeak lib",
+                "libespeak-ng was not found in the usual locations".to_string(),
+            ),
+            Err(err) => report.failed("espeak lib", format!("{err:#}")),
+        }
+        match resolve_espeak_path(
+            args.native_espeak_data.as_deref(),
+            detect_espeak_data,
+            "espeak-ng-data",
+        ) {
+            Ok(Some(path)) => report.ok("espeak data", path.display().to_string()),
+            Ok(None) => report.failed(
+                "espeak data",
+                "espeak-ng-data was not found in the usual locations".to_string(),
+            ),
+            Err(err) => report.failed("espeak data", format!("{err:#}")),
+        }
+    } else {
+        report.ok("espeak", "not required by this family".to_string());
+    }
+
+    match check_native_doctor_model(args.family, args.native_model.as_deref(), &cache_root) {
+        Ok(path) => {
+            let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            report.ok("model", format!("{} ({size} bytes)", path.display()));
+        }
+        Err(err) => report.failed("model", format!("{err:#}")),
+    }
+
+    let mut output = String::from("kitten-tts native doctor\n");
+    for line in &report.lines {
+        output.push_str(&format!("  {line}\n"));
+    }
+    if report.failures.is_empty() {
+        output.push_str("Result: ready for --engine native\n");
+    } else {
+        let mut hints: Vec<&str> = Vec::new();
+        for failure in &report.failures {
+            let hint = if failure.starts_with("library:") {
+                "pass --native-lib PATH or set AUDIOCPP_LIB"
+            } else if failure.starts_with("espeak") {
+                "install espeak-ng or pass --native-espeak-lib/--native-espeak-data PATH"
+            } else if args.family == NativeFamily::KittenTts {
+                "run kitten-tts native fetch or pass --native-model PATH"
+            } else {
+                "pass --native-model PATH to a local GGUF"
+            };
+            if !hints.contains(&hint) {
+                hints.push(hint);
+            }
+        }
+        output.push_str(&format!(
+            "Result: {} check(s) failed; {}\n",
+            report.failures.len(),
+            hints.join("; ")
+        ));
+    }
+    write_stdout(&output)?;
+
+    if !report.failures.is_empty() {
+        bail!("native environment is not ready; fix the FAILED checks above");
+    }
+    Ok(())
+}
+
 #[repr(C)]
 struct NativeModelConfig {
     family_hint: *const c_char,
@@ -3058,11 +3267,13 @@ fn main() -> Result<()> {
                     "  used by: kitten-tts synthesize --engine native --model mini-0.8 --native-lib PATH"
                 );
                 println!("  check the library first: kitten-tts native probe --native-lib PATH");
+                println!("  check library + eSpeak + model at once: kitten-tts native doctor");
             }
         },
         Commands::Native(native_cmd) => match native_cmd.command {
             NativeCommands::Probe(args) => probe_native_runtime(&args)?,
             NativeCommands::Fetch(args) => fetch_native_model(&args)?,
+            NativeCommands::Doctor(args) => doctor_native_runtime(&args)?,
         },
         Commands::Model(model_cmd) => {
             let client = build_http_client()?;
@@ -3642,5 +3853,51 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn doctor_reports_missing_cached_model() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let err = check_native_doctor_model(NativeFamily::KittenTts, None, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cached model is missing"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_accepts_cached_model() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let existing = dir.path().join("native").join(NATIVE_KITTEN_TTS_FILE);
+        fs::create_dir_all(existing.parent().expect("parent"))?;
+        fs::write(&existing, b"cached")?;
+
+        let path = check_native_doctor_model(NativeFamily::KittenTts, None, dir.path())?;
+        assert_eq!(path, existing);
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_v2_requires_explicit_model() {
+        let err = check_native_doctor_model(
+            NativeFamily::KittenTts2,
+            None,
+            Path::new("/nonexistent-cache"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not downloaded automatically"), "{err}");
+        assert!(err.contains("--native-model"), "{err}");
+    }
+
+    #[test]
+    fn doctor_rejects_missing_explicit_model() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let missing = dir.path().join("weights.gguf");
+        let err = check_native_doctor_model(NativeFamily::KittenTts, Some(&missing), dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        Ok(())
     }
 }

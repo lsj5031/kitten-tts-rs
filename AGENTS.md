@@ -176,6 +176,7 @@ Examples:
   - `auto` backend tries accelerators then `cpu`: `metal` on macOS arm64, `cuda`/`vulkan`/`hip` on Linux/Windows. Retry once on `cpu` when accelerated output is silent or non-finite.
   - Reject silent or non-finite native output instead of writing WAVs.
   - Never bundle GGUF weights or `libespeak-ng`; fetch weights with `native fetch` or on first use, and point at the user's library.
+  - `native doctor` checks library, eSpeak and model in one pass, reports every failure without downloading, and exits non-zero when a check fails.
   - KittenTTS 2 requires a local GGUF plus `--accept-kitten2-license`.
 - ONNX Runtime loading policy:
   - use dynamic loading (`load-dynamic`) with user/system-provided `libonnxruntime`
