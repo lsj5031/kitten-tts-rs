@@ -36,8 +36,15 @@ Concretely:
   `--native-model`, or `--native-family kitten_tts2`. The default ONNX preset
   `nano-0.8-fp32` continues to use ONNX Runtime. `--engine native` forces the
   native path. The ONNX path is still CUDA-only; no ORT CPU fallback was added.
-- **Correctness guard.** Native output that is silent or non-finite is rejected
-  rather than written to a WAV.
+- **Hardware acceleration by default.** `--native-backend auto` (the default)
+  selects Metal on macOS arm64 and CUDA for `kitten_tts2` elsewhere, then CPU. If
+  an accelerated run returns silent or non-finite audio, it is retried on CPU
+  before the command fails, so the guard above never has to reject a run that
+  the other backend can complete. Silent or non-finite output is never written
+  to a WAV.
+- **Explicit model prefetch.** `kitten-tts native fetch` downloads the Mini 0.8
+  GGUF without synthesizing, and `models list` points at it. KittenTTS 2 weights
+  remain a manual download.
 
 Decision owner: repository maintainer. Revisit this record if the audio.cpp ABI
 breaks its major version, if the Kitten ports regress, or if licensing terms
@@ -142,11 +149,12 @@ Verified against the reviewed audio.cpp revision, not guessed:
    equivalent is `--native-lib` plus `AUDIOCPP_LIB`, a hard refusal when the ABI
    major does not match, and a probe that reports the library's build version.
 8. **Backend validity is not guaranteed, and failures can be intermittent.**
-   With audio.cpp 0.9.2 and the Mini 0.8 FP32 GGUF, one early Metal run returned
-   non-finite samples; nine later runs (single- and multi-request) produced
-   valid audio. The CLI rejects silent or non-finite output, and `auto` stays on
-   CPU for 0.8 until upstream publishes a backend support matrix. Explicit GPU
-   selection remains available for users who validate their own combination.
+   With audio.cpp 0.9.2 and the Mini 0.8 FP32 GGUF, Metal returned non-finite or
+   silent samples in two runs among about a dozen, separated by successful
+   runs; CPU never failed. Because an accelerator can fail on an untested input
+   or host, `auto` validates the samples and retries on CPU instead of treating
+   the backend as trusted. GPU output is not sample-identical to CPU output, so
+   determinism is per-backend.
 
 ## Licensing and distribution
 
@@ -238,10 +246,17 @@ the native Kitten T T S engine. This is a real synthesis test." Voice `Leo`,
   consistent with WAV rounding rather than model divergence.
 - ONNX Runtime comparison was not possible: this host has no CUDA device and the
   ONNX path is CUDA-only.
-- Metal was faster than CPU once warmed: 0.89 s vs 1.71 s for the same 6.59 s
-  of audio at 8 threads (RTF 0.14 vs 0.26). One earlier Metal run returned
-  non-finite samples and was rejected before writing a WAV; that failure did not
-  reproduce in nine subsequent runs. `auto` therefore remains on CPU for 0.8.
+- Metal is faster than CPU once warmed: 0.79-0.89 s vs 1.71 s for the same
+  6.59 s of audio at 8 threads (RTF 0.12-0.14 vs 0.26). `auto` selects Metal on
+  macOS arm64 and produced valid audio in three consecutive 6.59 s runs
+  (158,200 samples, RMS 0.1486).
+- The retry path is not theoretical: a later short-text run returned invalid
+  audio from Metal and `auto` logged the retry, switched to CPU and wrote valid
+  output. Metal failures are therefore intermittent (two observed, separated by
+  successes); this is why the fallback exists.
+- Consequence for latency: `auto` is about 2x faster when Metal succeeds, and
+  slower by one failed attempt when it does not. `--native-backend cpu` is the
+  predictable choice.
 - No listening tests were run, so quality is inferred from duration, level,
   determinism and upstream parity only.
 
@@ -255,7 +270,7 @@ Verified gates:
   actionable messages.
 - Offline synthesis works from the cache after the model is present.
 
-### KittenTTS 2 (Q8, CPU)
+### KittenTTS 2 (Q8)
 
 Same machine, 8 threads, Q8 GGUF (3,343,404,128 bytes). Session ready 12.1-14.2 s,
 peak RSS 3.46 GiB. English "Hello from Kitten T T S two." with voice `Bruno` and
@@ -266,10 +281,15 @@ byte-identical across repeated runs. German preset: 108,480 samples (4.52 s) in
 `--speed 1.5` produced bit-identical audio to 1.0, confirming the port ignores
 speed; the CLI now prints a notice.
 
-Exercised: macOS arm64, native CPU — Mini 0.8 at 1 and 8 threads (single and
-multi-request), KittenTTS 2 Q8 (English, German, streaming, multi-request). Not
-exercised: native CUDA, Vulkan, HIP, Metal (fails for this family), Linux,
-Windows, v2 cloning and remaining language presets, listening quality.
+Metal also runs v2 and is faster: the same English request produced 75,360
+samples (3.14 s) in 2.92 s generation (RTF 0.93) including a 13.9 s session load,
+versus 4.9 s generation on CPU. The sample count differs from CPU (75,360 vs
+68,640), so determinism is per backend; output level was valid (RMS 0.117).
+
+Exercised: macOS arm64, native CPU and Metal — Mini 0.8 at 1 and 8 threads
+(single and multi-request), KittenTTS 2 Q8 (English, German, streaming,
+multi-request). Not exercised: native CUDA, Vulkan, HIP, Linux, Windows, v2
+cloning and remaining language presets, listening quality.
 
 ## CLI compatibility map
 
@@ -297,9 +317,10 @@ Windows, v2 cloning and remaining language presets, listening quality.
 - Will audio.cpp add cancellation to the C ABI? If not, decide between a worker
   thread with handle teardown and a subprocess boundary.
 - Which GPU backends are valid for `kitten_tts` on other hosts? CUDA was not
-  available here; Metal produced one non-finite run that did not reproduce, so
-  `auto` stays on CPU for 0.8. Revisit when upstream publishes a support matrix
-  or a fix.
+  available here, and Metal fails intermittently on this model, so `auto`
+  validates output and falls back to CPU. Revisit when upstream publishes a
+  support matrix or a fix; once Metal is reliable, the retry can stay as a cheap
+  safety net without changing selection.
 - Does the project want automatic v2 downloads after license review? Today v2
   requires a user-supplied GGUF, which keeps the 2.6-3.3 GB weights and the
   Stellon terms at arm's length.

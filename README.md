@@ -168,7 +168,8 @@ Requirements:
 - `libespeak-ng` for the KittenTTS 0.8 frontend (`--native-espeak-lib` and
   `--native-espeak-data`, or auto-detected under Homebrew/system paths)
 - KittenTTS Mini 0.8 GGUF, downloaded on first use (~288 MiB) into the cache, or
-  passed with `--native-model /path/to.gguf`
+  passed with `--native-model /path/to.gguf`. To download it ahead of time:
+  `kitten-tts native fetch` (add `--cache-dir` or `--force` as needed).
 
 ```bash
 kitten-tts synthesize \
@@ -176,7 +177,6 @@ kitten-tts synthesize \
   --engine native \
   --model mini-0.8 \
   --native-lib /path/to/libaudiocpp.dylib \
-  --native-backend cpu \
   --native-threads 8 \
   --native-espeak-lib /opt/homebrew/lib/libespeak-ng.dylib \
   --native-espeak-data /opt/homebrew/share/espeak-ng-data \
@@ -190,13 +190,21 @@ using ONNX Runtime. `--engine native` always uses the native engine.
 
 Native notes:
 
-- Auto backend is `cpu` for `kitten_tts`, and `cuda` then `cpu` for `kitten_tts2`
-  on Linux/Windows. `--native-backend cuda|metal|vulkan|hip` overrides it.
-- Auto stays on `cpu` for `kitten_tts`. One early Metal run with the Mini 0.8
-  FP32 GGUF returned non-finite samples; it did not reproduce, and Metal was
-  faster in later tests (0.89 s vs 1.71 s for 6.59 s of audio at 8 threads).
-  Opt in with `--native-backend metal`. Silent or non-finite output is rejected
-  instead of written to disk.
+- `--native-backend auto` (the default) tries accelerators before `cpu`:
+  `metal` on macOS arm64, and `cuda`, `vulkan`, `hip` on Linux/Windows (session
+  creation falls through the list). If the accelerated run returns silent or
+  non-finite audio, the CLI prints a notice and retries on `cpu` before failing.
+  Force one backend with `--native-backend cpu|metal|cuda|vulkan|hip`.
+- Measured on Apple M5 with 8 threads and the Mini 0.8 FP32 GGUF: Metal 0.79 s
+  vs CPU 1.71 s for 6.59 s of audio (RTF 0.12 vs 0.26). Metal is intermittently
+  unusable on this model: two observed runs among about a dozen returned silent
+  or non-finite samples, and `auto` then retried on CPU and completed. Expect the
+  retry (~1.5 s extra here) occasionally; forcing `--native-backend cpu`
+  avoids it.
+- For `kitten_tts2`, `auto` also selects Metal on macOS (2.92 s vs 4.9 s for
+  3.14 s of audio at 8 threads). Backends do not produce identical samples: the
+  same seed gave 75,360 samples on Metal vs 68,640 on CPU, so determinism holds
+  per backend.
 - `--style-index`, `--vram-profile`, and `--repo-id` are ONNX-only and rejected
   on the native path.
 - `--trim-tail` and `--phonemizer` are ONNX-only. The native 0.8 frontend uses
@@ -229,10 +237,30 @@ kitten-tts synthesize \
 ```
 
 v2 weights are not downloaded automatically and are not bundled. Validated here
-with the 2026-10-21 Q8 GGUF (3.34 GB) on macOS arm64 CPU: English and German
-presets, streaming, multi-chunk text and seeded determinism all work. Not
-validated: CUDA, cloning, the remaining language presets, or listening quality.
-The port ignores `--speed`; the CLI prints a notice when it is set.
+with the 2026-10-21 Q8 GGUF (3.34 GB) on macOS arm64 CPU and Metal: English and
+German presets, streaming, multi-chunk text and seeded determinism all work.
+Metal is faster (2.92 s vs 4.9 s for 3.14 s of audio at 8 threads), and the same
+seed produces different sample counts across backends, so treat determinism as
+per-backend. Metal on v2 has not shown the invalid-output behaviour seen on
+0.8; `auto` still validates and retries on CPU. Not validated: CUDA, cloning, the remaining language presets, or
+listening quality. The port ignores `--speed`; the CLI prints a notice when it is
+set.
+
+### Native model download
+
+`native fetch` downloads the native model without synthesizing, so the weights
+can be prepared ahead of time or on another machine:
+
+```bash
+kitten-tts native fetch                          # into the platform cache
+kitten-tts native fetch --cache-dir ./models     # into a specific directory
+kitten-tts native fetch --force                  # re-download even if cached
+```
+
+It prints the resolved path, byte size and source URL, and needs no ONNX Runtime.
+`native fetch --family kitten_tts2` exits with an explanation instead of
+downloading, because v2 weights require a manual download and license
+acknowledgement. `kitten-tts models list` also prints the native download hint.
 
 ### Native probe
 

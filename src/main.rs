@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString};
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::raw::{c_char, c_int, c_void};
@@ -241,6 +242,10 @@ enum ModelsCommands {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    about = "Native audio.cpp engine: probe the library and download models",
+    long_about = "Native audio.cpp engine control. `probe` reports whether a local audio.cpp C API library works; `fetch` downloads the Mini 0.8 GGUF so `--engine native` can run offline. Neither command needs ONNX Runtime."
+)]
 struct NativeCommandTop {
     #[command(subcommand)]
     command: NativeCommands,
@@ -248,7 +253,28 @@ struct NativeCommandTop {
 
 #[derive(Debug, Subcommand)]
 enum NativeCommands {
+    /// Check the audio.cpp library, its ABI and available model families
     Probe(NativeProbeArgs),
+    /// Download the native model into the cache
+    #[command(
+        long_about = "Download the KittenTTS Mini 0.8 GGUF used by `--engine native --model mini-0.8` into the cache directory. Re-running is cheap: an existing file is reused unless --force is passed. KittenTTS 2 weights are licensed differently and are never downloaded by this command."
+    )]
+    Fetch(NativeFetchArgs),
+}
+
+#[derive(Debug, Args)]
+struct NativeFetchArgs {
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = NativeFamily::KittenTts,
+        help = "Native model family to download"
+    )]
+    family: NativeFamily,
+    #[arg(long, help = "Cache directory (default: platform cache directory)")]
+    cache_dir: Option<PathBuf>,
+    #[arg(long, help = "Re-download even when the file is already cached")]
+    force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -471,14 +497,16 @@ enum NativeBackend {
 }
 
 impl NativeBackend {
-    fn candidates(self, family: NativeFamily) -> Vec<&'static str> {
+    fn candidates(self) -> Vec<&'static str> {
         match self {
             Self::Auto => {
                 let mut backends = Vec::new();
-                if family == NativeFamily::KittenTts2
-                    && (cfg!(target_os = "linux") || cfg!(target_os = "windows"))
-                {
+                if cfg!(target_os = "macos") {
+                    backends.push("metal");
+                } else if cfg!(target_os = "linux") || cfg!(target_os = "windows") {
                     backends.push("cuda");
+                    backends.push("vulkan");
+                    backends.push("hip");
                 }
                 backends.push("cpu");
                 backends
@@ -560,12 +588,7 @@ impl ModelSelection {
     }
 
     fn resolve_cache_dir(&self) -> Result<PathBuf> {
-        if let Some(cache_dir) = &self.cache_dir {
-            return Ok(cache_dir.clone());
-        }
-        let dirs = ProjectDirs::from("io", "KittenML", "kitten-tts")
-            .ok_or_else(|| anyhow!("could not determine platform cache directory"))?;
-        Ok(dirs.cache_dir().to_path_buf())
+        resolve_cache_root(self.cache_dir.as_deref())
     }
 
     fn resolve_ort_runtime_config(&self) -> OrtRuntimeConfig {
@@ -1857,6 +1880,15 @@ fn parse_shape(header: &str) -> Option<Vec<usize>> {
     Some(shape)
 }
 
+fn resolve_cache_root(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    let dirs = ProjectDirs::from("io", "KittenML", "kitten-tts")
+        .ok_or_else(|| anyhow!("could not determine platform cache directory"))?;
+    Ok(dirs.cache_dir().to_path_buf())
+}
+
 fn build_http_client() -> Result<Client> {
     Client::builder()
         .user_agent("kitten-tts-rs/0.1.0")
@@ -2128,17 +2160,48 @@ fn ensure_native_model_cached(
         return Ok(path.clone());
     }
 
+    ensure_native_kitten_tts_model(client, cache_root, false)
+}
+
+fn ensure_native_kitten_tts_model(
+    client: &Client,
+    cache_root: &Path,
+    force: bool,
+) -> Result<PathBuf> {
     let native_dir = cache_root.join("native");
     fs::create_dir_all(&native_dir)
         .with_context(|| format!("failed creating native cache dir {}", native_dir.display()))?;
     let destination = native_dir.join(NATIVE_KITTEN_TTS_FILE);
-    if !destination.is_file() {
+    if force || !destination.is_file() {
         let remote = format!("{NATIVE_KITTEN_TTS_DIR}/{NATIVE_KITTEN_TTS_FILE}");
         eprintln!("[Native] downloading {NATIVE_MODEL_REPO}/{remote} (about 288 MiB)");
         download_repo_file(client, NATIVE_MODEL_REPO, &remote, &destination)
             .with_context(|| format!("failed downloading native model {remote}"))?;
     }
     Ok(destination)
+}
+
+fn fetch_native_model(args: &NativeFetchArgs) -> Result<()> {
+    if args.family == NativeFamily::KittenTts2 {
+        bail!(
+            "KittenTTS 2 weights are not downloaded automatically because of their license (commercial registration and revenue limits). Download a GGUF from https://huggingface.co/{NATIVE_MODEL_REPO}/tree/main/KittenTTS2-GGUF and pass it with --native-model, plus --accept-kitten2-license when synthesizing"
+        );
+    }
+
+    let cache_root = resolve_cache_root(args.cache_dir.as_deref())?;
+    let client = build_http_client()?;
+    let path = ensure_native_kitten_tts_model(&client, &cache_root, args.force)?;
+    let size = fs::metadata(&path)
+        .with_context(|| format!("failed reading model metadata at {}", path.display()))?
+        .len();
+
+    println!("Native package: {}", args.family.as_str());
+    println!("Model: {}", path.display());
+    println!("Size: {size} bytes");
+    println!(
+        "Source: https://huggingface.co/{NATIVE_MODEL_REPO}/resolve/main/{NATIVE_KITTEN_TTS_DIR}/{NATIVE_KITTEN_TTS_FILE}"
+    );
+    Ok(())
 }
 
 type NativeAbiVersionFn = unsafe extern "C" fn() -> u32;
@@ -2438,6 +2501,36 @@ struct NativeSynth {
     session: *mut c_void,
     family: NativeFamily,
     random_voice_state_path: PathBuf,
+    backend: &'static str,
+    auto_backend: bool,
+    threads: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NativeAudioError {
+    NonFinite(usize),
+    Silent,
+}
+
+impl fmt::Display for NativeAudioError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonFinite(index) => write!(
+                f,
+                "native backend produced non-finite audio at sample {index}; this backend may not support the model family. Retry with --native-backend cpu"
+            ),
+            Self::Silent => write!(
+                f,
+                "native backend produced silent audio; this backend may not support the model family. Retry with --native-backend cpu"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NativeAudioError {}
+
+fn should_retry_on_cpu(auto_backend: bool, backend: &str, err: &anyhow::Error) -> bool {
+    auto_backend && backend != "cpu" && err.downcast_ref::<NativeAudioError>().is_some()
 }
 
 impl Drop for NativeSynth {
@@ -2485,6 +2578,7 @@ impl NativeSynth {
             espeak_data,
         } = config;
         let library = open_native_library(library_path)?;
+        let auto_backend = backend == NativeBackend::Auto;
         let mut synthesizer = Self {
             last_error: load_native_symbol(&library, "audiocpp_last_error")?,
             status_string: load_native_symbol(&library, "audiocpp_status_string")?,
@@ -2512,6 +2606,9 @@ impl NativeSynth {
             session: std::ptr::null_mut(),
             family,
             random_voice_state_path: cache_root.join("last_random_voice.txt"),
+            backend: "cpu",
+            auto_backend,
+            threads,
             _library: library,
         };
 
@@ -2576,7 +2673,7 @@ impl NativeSynth {
 
         let task = c_string("tts")?;
         let mode = c_string("offline")?;
-        let candidates = backend.candidates(family);
+        let candidates = backend.candidates();
         let attempt_count = candidates.len();
         let mut session_error = None;
         for backend_name in candidates {
@@ -2600,6 +2697,7 @@ impl NativeSynth {
             if status == AUDIOCPP_OK {
                 eprintln!("[Native] backend={backend_name}");
                 synthesizer.session = session;
+                synthesizer.backend = backend_name;
                 break;
             }
             let message = synthesizer.describe_status(status);
@@ -2670,8 +2768,23 @@ impl NativeSynth {
         let mut total_samples = 0usize;
         let mut first_audio = None;
         for chunk in chunks {
-            let audio =
-                self.run_chunk(&chunk, resolved_voice.as_deref(), config.speed, config.seed)?;
+            let audio = match self.run_chunk(
+                &chunk,
+                resolved_voice.as_deref(),
+                config.speed,
+                config.seed,
+            ) {
+                Ok(audio) => audio,
+                Err(err) if should_retry_on_cpu(self.auto_backend, self.backend, &err) => {
+                    eprintln!(
+                        "[Native] backend={} returned invalid audio; retrying with cpu",
+                        self.backend
+                    );
+                    self.switch_backend("cpu")?;
+                    self.run_chunk(&chunk, resolved_voice.as_deref(), config.speed, config.seed)?
+                }
+                Err(err) => return Err(err),
+            };
             if first_audio.is_none() {
                 first_audio = Some(started.elapsed());
             }
@@ -2683,6 +2796,44 @@ impl NativeSynth {
             started.elapsed().as_secs_f64(),
             first_audio.map(|d| d.as_millis()).unwrap_or(0)
         );
+        Ok(())
+    }
+
+    fn switch_backend(&mut self, backend: &'static str) -> Result<()> {
+        if self.backend == backend {
+            return Ok(());
+        }
+
+        let task = c_string("tts")?;
+        let mode = c_string("offline")?;
+        let backend_name = c_string(backend)?;
+        let backend_config = NativeBackendConfig {
+            backend: backend_name.as_ptr(),
+            device: 0,
+            threads: self.threads,
+        };
+        let mut session: *mut c_void = std::ptr::null_mut();
+        self.check_status(
+            unsafe {
+                (self.session_create)(
+                    self.model,
+                    task.as_ptr(),
+                    mode.as_ptr(),
+                    &backend_config,
+                    self.options,
+                    &mut session,
+                )
+            },
+            &format!("failed to switch native backend to {backend}"),
+        )?;
+        if session.is_null() {
+            bail!("native engine returned no session for backend {backend}");
+        }
+
+        unsafe { (self.session_free)(self.session) };
+        self.session = session;
+        self.backend = backend;
+        eprintln!("[Native] switched backend={backend}");
         Ok(())
     }
 
@@ -2830,14 +2981,10 @@ impl NativeSynth {
             };
 
             if let Some(index) = audio.iter().position(|sample| !sample.is_finite()) {
-                bail!(
-                    "native backend produced non-finite audio at sample {index}; this backend may not support the model family. Retry with --native-backend cpu"
-                );
+                return Err(NativeAudioError::NonFinite(index).into());
             }
             if audio.iter().all(|sample| sample.abs() < 1e-6) {
-                bail!(
-                    "native backend produced silent audio; this backend may not support the model family. Retry with --native-backend cpu"
-                );
+                return Err(NativeAudioError::Silent.into());
             }
 
             Ok(audio)
@@ -2903,10 +3050,19 @@ fn main() -> Result<()> {
                         marker
                     );
                 }
+                println!();
+                println!("Native engine (optional, no ONNX Runtime):");
+                println!("- {NATIVE_KITTEN_TTS_DIR}/{NATIVE_KITTEN_TTS_FILE} (about 288 MiB)");
+                println!("  download with: kitten-tts native fetch [--cache-dir DIR] [--force]");
+                println!(
+                    "  used by: kitten-tts synthesize --engine native --model mini-0.8 --native-lib PATH"
+                );
+                println!("  check the library first: kitten-tts native probe --native-lib PATH");
             }
         },
         Commands::Native(native_cmd) => match native_cmd.command {
             NativeCommands::Probe(args) => probe_native_runtime(&args)?,
+            NativeCommands::Fetch(args) => fetch_native_model(&args)?,
         },
         Commands::Model(model_cmd) => {
             let client = build_http_client()?;
@@ -3406,17 +3562,53 @@ mod tests {
     }
 
     #[test]
-    fn native_auto_backend_is_cpu_for_kitten_tts() {
-        assert_eq!(
-            NativeBackend::Auto.candidates(NativeFamily::KittenTts),
-            vec!["cpu"]
-        );
+    fn native_auto_backend_prefers_hardware_then_cpu() {
+        let candidates = NativeBackend::Auto.candidates();
+        assert_eq!(candidates.last().copied(), Some("cpu"));
+        if cfg!(target_os = "macos") {
+            assert_eq!(candidates.first().copied(), Some("metal"));
+        }
+        if cfg!(target_os = "linux") || cfg!(target_os = "windows") {
+            assert_eq!(candidates.first().copied(), Some("cuda"));
+        }
+        assert_eq!(NativeBackend::Cpu.candidates(), vec!["cpu"]);
     }
 
     #[test]
-    fn native_auto_backend_ends_with_cpu() {
-        let candidates = NativeBackend::Auto.candidates(NativeFamily::KittenTts2);
-        assert_eq!(candidates.last().copied(), Some("cpu"));
+    fn native_invalid_audio_retries_on_cpu_only_in_auto_mode() {
+        let audio_error: anyhow::Error = NativeAudioError::Silent.into();
+        assert!(should_retry_on_cpu(true, "metal", &audio_error));
+        assert!(!should_retry_on_cpu(false, "metal", &audio_error));
+        assert!(!should_retry_on_cpu(true, "cpu", &audio_error));
+
+        let other_error = anyhow!("session failed");
+        assert!(!should_retry_on_cpu(true, "metal", &other_error));
+    }
+
+    #[test]
+    fn native_fetch_refuses_v2_without_network() {
+        let args = NativeFetchArgs {
+            family: NativeFamily::KittenTts2,
+            cache_dir: None,
+            force: false,
+        };
+        let err = fetch_native_model(&args).unwrap_err().to_string();
+        assert!(err.contains("not downloaded automatically"), "{err}");
+        assert!(err.contains("--accept-kitten2-license"), "{err}");
+    }
+
+    #[test]
+    fn native_fetch_uses_cached_model_without_force() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let existing = dir.path().join("native").join(NATIVE_KITTEN_TTS_FILE);
+        fs::create_dir_all(existing.parent().expect("parent"))?;
+        fs::write(&existing, b"cached")?;
+
+        let client = build_http_client()?;
+        let path = ensure_native_kitten_tts_model(&client, dir.path(), false)?;
+        assert_eq!(path, existing);
+        assert_eq!(fs::read(&path)?, b"cached");
+        Ok(())
     }
 
     #[test]
