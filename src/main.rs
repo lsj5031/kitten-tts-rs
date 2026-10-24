@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
+use libloading::Library;
 use ndarray::{Array1, Array2};
 use once_cell::sync::{Lazy, OnceCell};
 use ort::{
@@ -13,11 +14,13 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::{CStr, CString};
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
+use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zip::ZipArchive;
 
 const DEFAULT_REPO_ID: &str = "KittenML/kitten-tts-nano-0.8-fp32";
@@ -41,6 +44,17 @@ const VRAM_HEADROOM_MIB: u64 = 512;
 const SAFE_PLAYBACK_PEAK: f32 = 0.98;
 const TOKEN_PAD_ID: i64 = 0;
 const MAX_NPY_ENTRY_BYTES: u64 = 50 * 1024 * 1024;
+const AUDIOCPP_ABI_MAJOR: u32 = 0;
+const AUDIOCPP_LIB_ENV: &str = "AUDIOCPP_LIB";
+const AUDIOCPP_OK: c_int = 0;
+const MAX_NATIVE_FAMILIES: usize = 4096;
+const MAX_NATIVE_TASKS: usize = 64;
+const NATIVE_MODEL_REPO: &str = "audio-cpp/audio.cpp-gguf";
+const NATIVE_KITTEN_TTS_DIR: &str = "KittenTTS-GGUF";
+const NATIVE_KITTEN_TTS_FILE: &str = "kitten-tts-mini-0.8-orig.gguf";
+const NATIVE_KITTEN_TTS_VOICES: [&str; 8] = [
+    "Bella", "Jasper", "Luna", "Bruno", "Rosie", "Hugo", "Kiki", "Leo",
+];
 
 static SPACES_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").expect("valid regex"));
 static ORT_INIT: OnceCell<()> = OnceCell::new();
@@ -61,6 +75,7 @@ enum Commands {
     Voices(VoicesArgs),
     Model(ModelCommandTop),
     Models(ModelsCommandTop),
+    Native(NativeCommandTop),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -88,6 +103,62 @@ struct SynthesisArgs {
     seed: Option<u64>,
     #[arg(long, value_enum, default_value_t = PhonemizerMode::EspeakNg)]
     phonemizer: PhonemizerMode,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = EngineChoice::Auto,
+        help = "Synthesis engine: auto (native when supported, else ONNX), onnx, or native"
+    )]
+    engine: EngineChoice,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to the audio.cpp C API library for the native engine (default: AUDIOCPP_LIB or platform library name)"
+    )]
+    native_lib: Option<PathBuf>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = NativeBackend::Auto,
+        help = "Native backend: auto, cpu, cuda, metal, vulkan, or hip"
+    )]
+    native_backend: NativeBackend,
+    #[arg(
+        long,
+        default_value_t = 1,
+        help = "Worker threads for the native engine"
+    )]
+    native_threads: i32,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Local GGUF for the native engine (default: download KittenTTS Mini 0.8)"
+    )]
+    native_model: Option<PathBuf>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = NativeFamily::KittenTts,
+        help = "Native model family"
+    )]
+    native_family: NativeFamily,
+    #[arg(
+        long,
+        help = "Acknowledge the KittenTTS 2 weight license (required for --native-family kitten_tts2)"
+    )]
+    accept_kitten2_license: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to libespeak-ng for the native KittenTTS 0.8 frontend (default: auto-detect)"
+    )]
+    native_espeak_lib: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to espeak-ng-data for the native KittenTTS 0.8 frontend (default: auto-detect)"
+    )]
+    native_espeak_data: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -167,6 +238,32 @@ struct ModelsCommandTop {
 #[derive(Debug, Subcommand)]
 enum ModelsCommands {
     List,
+}
+
+#[derive(Debug, Args)]
+struct NativeCommandTop {
+    #[command(subcommand)]
+    command: NativeCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum NativeCommands {
+    Probe(NativeProbeArgs),
+}
+
+#[derive(Debug, Args)]
+struct NativeProbeArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to the audio.cpp C API library (default: AUDIOCPP_LIB or platform library name)"
+    )]
+    native_lib: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Fail unless this model family is available (for example kitten_tts)"
+    )]
+    family: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -342,7 +439,7 @@ enum WavEncoding {
     Float32,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum PhonemizerMode {
     Auto,
     EspeakNg,
@@ -354,6 +451,69 @@ enum PlayerMode {
     Auto,
     Ffplay,
     PwPlay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum EngineChoice {
+    Auto,
+    Onnx,
+    Native,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum NativeBackend {
+    Auto,
+    Cpu,
+    Cuda,
+    Metal,
+    Vulkan,
+    Hip,
+}
+
+impl NativeBackend {
+    fn candidates(self, family: NativeFamily) -> Vec<&'static str> {
+        match self {
+            Self::Auto => {
+                let mut backends = Vec::new();
+                if family == NativeFamily::KittenTts2
+                    && (cfg!(target_os = "linux") || cfg!(target_os = "windows"))
+                {
+                    backends.push("cuda");
+                }
+                backends.push("cpu");
+                backends
+            }
+            Self::Cpu => vec!["cpu"],
+            Self::Cuda => vec!["cuda"],
+            Self::Metal => vec!["metal"],
+            Self::Vulkan => vec!["vulkan"],
+            Self::Hip => vec!["hip"],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum NativeFamily {
+    #[value(name = "kitten_tts")]
+    KittenTts,
+    #[value(name = "kitten_tts2")]
+    KittenTts2,
+}
+
+impl NativeFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::KittenTts => "kitten_tts",
+            Self::KittenTts2 => "kitten_tts2",
+        }
+    }
+
+    fn canonical_voices(self) -> &'static [&'static str] {
+        match self {
+            Self::KittenTts => &NATIVE_KITTEN_TTS_VOICES,
+            Self::KittenTts2 => &[],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -896,37 +1056,7 @@ impl Synthesizer {
         phonemizer: &dyn Phonemizer,
         mut on_chunk: impl FnMut(&[f32]) -> Result<()>,
     ) -> Result<()> {
-        if !config.speed.is_finite() || !(MIN_SPEED..=MAX_SPEED).contains(&config.speed) {
-            bail!("speed must be between {MIN_SPEED} and {MAX_SPEED}");
-        }
-        if config.max_chars == 0 || config.max_chars > MAX_CHARS_HARD_LIMIT {
-            bail!(
-                "max_chars must be between 1 and {MAX_CHARS_HARD_LIMIT} to avoid unsafe runtime load"
-            );
-        }
-        let cleaned = clean_text_basic(text);
-        if cleaned.is_empty() {
-            bail!("input text is empty after basic normalization");
-        }
-        if cleaned.len() > MAX_TOTAL_INPUT_CHARS {
-            bail!(
-                "input text too long ({} chars). Max allowed is {} for runtime safety",
-                cleaned.len(),
-                MAX_TOTAL_INPUT_CHARS
-            );
-        }
-
-        let chunks = chunk_text(&cleaned, config.max_chars);
-        if chunks.is_empty() {
-            bail!("input text produced zero chunks");
-        }
-        if chunks.len() > MAX_SYNTHESIS_CHUNKS {
-            bail!(
-                "input produced too many chunks ({}). Max allowed is {} for runtime safety",
-                chunks.len(),
-                MAX_SYNTHESIS_CHUNKS
-            );
-        }
+        let chunks = prepare_synthesis_chunks(text, config.speed, config.max_chars)?;
 
         let mut rng = SimpleRng::from_seed(config.seed.unwrap_or_else(runtime_entropy_seed));
         let canonical_voice = self.resolve_voice(voice, &mut rng)?;
@@ -1238,6 +1368,51 @@ fn ensure_punctuation(text: &str) -> String {
         trimmed.to_string()
     } else {
         format!("{trimmed},")
+    }
+}
+
+fn prepare_synthesis_chunks(text: &str, speed: f32, max_chars: usize) -> Result<Vec<String>> {
+    if !speed.is_finite() || !(MIN_SPEED..=MAX_SPEED).contains(&speed) {
+        bail!("speed must be between {MIN_SPEED} and {MAX_SPEED}");
+    }
+    if max_chars == 0 || max_chars > MAX_CHARS_HARD_LIMIT {
+        bail!(
+            "max_chars must be between 1 and {MAX_CHARS_HARD_LIMIT} to avoid unsafe runtime load"
+        );
+    }
+    let cleaned = clean_text_basic(text);
+    if cleaned.is_empty() {
+        bail!("input text is empty after basic normalization");
+    }
+    if cleaned.len() > MAX_TOTAL_INPUT_CHARS {
+        bail!(
+            "input text too long ({} chars). Max allowed is {} for runtime safety",
+            cleaned.len(),
+            MAX_TOTAL_INPUT_CHARS
+        );
+    }
+
+    let chunks = chunk_text(&cleaned, max_chars);
+    if chunks.is_empty() {
+        bail!("input text produced zero chunks");
+    }
+    if chunks.len() > MAX_SYNTHESIS_CHUNKS {
+        bail!(
+            "input produced too many chunks ({}). Max allowed is {} for runtime safety",
+            chunks.len(),
+            MAX_SYNTHESIS_CHUNKS
+        );
+    }
+    Ok(chunks)
+}
+
+fn prepare_native_chunks(text: &str, speed: f32, max_chars: usize) -> Result<Vec<String>> {
+    let chunks = prepare_synthesis_chunks(text, speed, max_chars)?;
+    let cleaned = clean_text_basic(text);
+    if cleaned.len() <= max_chars {
+        Ok(vec![cleaned])
+    } else {
+        Ok(chunks)
     }
 }
 
@@ -1691,10 +1866,96 @@ fn build_http_client() -> Result<Client> {
         .context("failed building HTTP client")
 }
 
-fn prepare_synthesis_runtime(
-    args: &SynthesisArgs,
-) -> Result<(String, Synthesizer, Box<dyn Phonemizer>)> {
+enum SynthesisBackend {
+    Onnx {
+        synthesizer: Synthesizer,
+        phonemizer: Box<dyn Phonemizer>,
+    },
+    Native(NativeSynth),
+}
+
+impl SynthesisBackend {
+    fn synthesize(
+        &mut self,
+        text: &str,
+        voice: Option<&str>,
+        config: SynthesisConfig,
+    ) -> Result<Vec<f32>> {
+        match self {
+            Self::Onnx {
+                synthesizer,
+                phonemizer,
+            } => synthesizer.synthesize(text, voice, config, phonemizer.as_ref()),
+            Self::Native(synthesizer) => synthesizer.synthesize(text, voice, config),
+        }
+    }
+
+    fn synthesize_streaming(
+        &mut self,
+        text: &str,
+        voice: Option<&str>,
+        config: SynthesisConfig,
+        on_chunk: impl FnMut(&[f32]) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            Self::Onnx {
+                synthesizer,
+                phonemizer,
+            } => {
+                synthesizer.synthesize_streaming(text, voice, config, phonemizer.as_ref(), on_chunk)
+            }
+            Self::Native(synthesizer) => {
+                synthesizer.synthesize_streaming(text, voice, config, on_chunk)
+            }
+        }
+    }
+}
+
+fn prepare_synthesis_runtime(args: &SynthesisArgs) -> Result<(String, SynthesisBackend)> {
     let text = read_text_input(&args.text)?;
+
+    match args.engine {
+        EngineChoice::Onnx => Ok((text, prepare_onnx_backend(args)?)),
+        EngineChoice::Native => Ok((text, prepare_native_backend(args)?)),
+        EngineChoice::Auto => match auto_native_intent(args) {
+            AutoNativeIntent::Required => Ok((text, prepare_native_backend(args)?)),
+            AutoNativeIntent::Opportunistic => match prepare_native_backend(args) {
+                Ok(backend) => Ok((text, backend)),
+                Err(err) => {
+                    eprintln!(
+                        "note: native engine unavailable ({err:#}); falling back to ONNX Runtime"
+                    );
+                    Ok((text, prepare_onnx_backend(args)?))
+                }
+            },
+            AutoNativeIntent::None => Ok((text, prepare_onnx_backend(args)?)),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoNativeIntent {
+    Required,
+    Opportunistic,
+    None,
+}
+
+fn auto_native_intent(args: &SynthesisArgs) -> AutoNativeIntent {
+    if args.native_model.is_some()
+        || args.native_lib.is_some()
+        || args.native_family == NativeFamily::KittenTts2
+        || args.native_espeak_lib.is_some()
+        || args.native_espeak_data.is_some()
+    {
+        AutoNativeIntent::Required
+    } else if args.model.model == Some(ModelPreset::Mini08) {
+        AutoNativeIntent::Opportunistic
+    } else {
+        AutoNativeIntent::None
+    }
+}
+
+fn prepare_onnx_backend(args: &SynthesisArgs) -> Result<SynthesisBackend> {
     let client = build_http_client()?;
     let cache_root = args.model.resolve_cache_dir()?;
     let repo_id = args.model.resolve_repo_id();
@@ -1702,7 +1963,921 @@ fn prepare_synthesis_runtime(
     let artifacts = ensure_model_cached(&client, &cache_root, &repo_id, false)?;
     let synthesizer = Synthesizer::new(&artifacts, &ort_runtime)?;
     let phonemizer = detect_phonemizer(args.phonemizer)?;
-    Ok((text, synthesizer, phonemizer))
+    Ok(SynthesisBackend::Onnx {
+        synthesizer,
+        phonemizer,
+    })
+}
+
+fn prepare_native_backend(args: &SynthesisArgs) -> Result<SynthesisBackend> {
+    validate_native_args(args)?;
+
+    if args.phonemizer != PhonemizerMode::EspeakNg {
+        eprintln!(
+            "note: the native engine uses its built-in eSpeak-ng frontend; --phonemizer is ignored"
+        );
+    }
+    if args.trim_tail != DEFAULT_TRIM_TAIL {
+        eprintln!("note: --trim-tail is ONNX-only and is ignored by the native engine");
+    }
+    if args.native_family == NativeFamily::KittenTts2 && (args.speed - 1.0).abs() > 1e-6 {
+        eprintln!("note: the kitten_tts2 port does not implement --speed; using its default rate");
+    }
+
+    if args.native_model.is_none() && args.model.model.is_none() {
+        eprintln!(
+            "[Native] using KittenTTS Mini 0.8, the only packaged native model (the ONNX default preset does not apply)"
+        );
+    }
+
+    let library_path = resolve_native_lib_path(args.native_lib.as_deref());
+    let cache_root = args.model.resolve_cache_dir()?;
+    let client = build_http_client()?;
+    let model_path = ensure_native_model_cached(&client, &cache_root, args)?;
+    let (espeak_lib, espeak_data) = if args.native_family == NativeFamily::KittenTts {
+        (
+            resolve_espeak_path(
+                args.native_espeak_lib.as_deref(),
+                detect_espeak_library,
+                "libespeak-ng",
+            )?,
+            resolve_espeak_path(
+                args.native_espeak_data.as_deref(),
+                detect_espeak_data,
+                "espeak-ng-data",
+            )?,
+        )
+    } else {
+        if args.native_espeak_lib.is_some() || args.native_espeak_data.is_some() {
+            eprintln!(
+                "note: --native-espeak-lib/--native-espeak-data only apply to kitten_tts; ignored"
+            );
+        }
+        (None, None)
+    };
+    let load_started = Instant::now();
+    let synthesizer = NativeSynth::open(NativeOpenConfig {
+        library_path: &library_path,
+        family: args.native_family,
+        backend: args.native_backend,
+        threads: args.native_threads,
+        model_path: &model_path,
+        cache_root: &cache_root,
+        espeak_lib: espeak_lib.as_deref(),
+        espeak_data: espeak_data.as_deref(),
+    })?;
+    eprintln!(
+        "[Native] session ready in {} ms",
+        load_started.elapsed().as_millis()
+    );
+
+    Ok(SynthesisBackend::Native(synthesizer))
+}
+
+fn validate_native_args(args: &SynthesisArgs) -> Result<()> {
+    if !(1..=256).contains(&args.native_threads) {
+        bail!("--native-threads must be between 1 and 256");
+    }
+    if args.style_index.is_some() {
+        bail!("--style-index is not supported by the native engine; omit it or pass --engine onnx");
+    }
+    if args.model.vram_profile.is_some() {
+        bail!("--vram-profile is ONNX-only; omit it or pass --engine onnx");
+    }
+    if args.model.repo_id.is_some() {
+        bail!(
+            "--repo-id selects an ONNX repository and cannot be combined with the native engine; pass --native-model PATH instead"
+        );
+    }
+    if args.native_model.is_none()
+        && let Some(preset) = args.model.model
+        && preset != ModelPreset::Mini08
+    {
+        bail!(
+            "the native engine currently provides only the KittenTTS Mini 0.8 package; pass --model mini-0.8 or --native-model PATH"
+        );
+    }
+    if args.native_family == NativeFamily::KittenTts2 {
+        if !args.accept_kitten2_license {
+            bail!(
+                "KittenTTS 2 weights use the Stellon Labs Community License (commercial registration and revenue limits). Pass --accept-kitten2-license to confirm, and see docs/native-backend-evaluation.md"
+            );
+        }
+        if args.native_model.is_none() {
+            bail!(
+                "KittenTTS 2 weights are not downloaded automatically; pass --native-model PATH to a local GGUF"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_espeak_path(
+    explicit: Option<&Path>,
+    detect: fn() -> Option<PathBuf>,
+    label: &str,
+) -> Result<Option<PathBuf>> {
+    if let Some(path) = explicit {
+        if !path.exists() {
+            bail!("{label} path '{}' does not exist", path.display());
+        }
+        return Ok(Some(path.to_path_buf()));
+    }
+    Ok(detect())
+}
+
+fn detect_espeak_library() -> Option<PathBuf> {
+    const CANDIDATES: [&str; 6] = [
+        "/opt/homebrew/lib/libespeak-ng.dylib",
+        "/usr/local/lib/libespeak-ng.dylib",
+        "/usr/lib/aarch64-linux-gnu/libespeak-ng.so.1",
+        "/usr/lib/x86_64-linux-gnu/libespeak-ng.so.1",
+        "/usr/lib/libespeak-ng.so.1",
+        "/usr/local/lib/libespeak-ng.so",
+    ];
+    CANDIDATES
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+}
+
+fn detect_espeak_data() -> Option<PathBuf> {
+    const CANDIDATES: [&str; 3] = [
+        "/opt/homebrew/share/espeak-ng-data",
+        "/usr/local/share/espeak-ng-data",
+        "/usr/share/espeak-ng-data",
+    ];
+    CANDIDATES
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_dir())
+}
+
+fn ensure_native_model_cached(
+    client: &Client,
+    cache_root: &Path,
+    args: &SynthesisArgs,
+) -> Result<PathBuf> {
+    if let Some(path) = &args.native_model {
+        if !path.is_file() {
+            bail!(
+                "native model '{}' does not exist or is not a file",
+                path.display()
+            );
+        }
+        return Ok(path.clone());
+    }
+
+    let native_dir = cache_root.join("native");
+    fs::create_dir_all(&native_dir)
+        .with_context(|| format!("failed creating native cache dir {}", native_dir.display()))?;
+    let destination = native_dir.join(NATIVE_KITTEN_TTS_FILE);
+    if !destination.is_file() {
+        let remote = format!("{NATIVE_KITTEN_TTS_DIR}/{NATIVE_KITTEN_TTS_FILE}");
+        eprintln!("[Native] downloading {NATIVE_MODEL_REPO}/{remote} (about 288 MiB)");
+        download_repo_file(client, NATIVE_MODEL_REPO, &remote, &destination)
+            .with_context(|| format!("failed downloading native model {remote}"))?;
+    }
+    Ok(destination)
+}
+
+type NativeAbiVersionFn = unsafe extern "C" fn() -> u32;
+type NativeStringFn = unsafe extern "C" fn() -> *const c_char;
+type NativeStatusStringFn = unsafe extern "C" fn(c_int) -> *const c_char;
+type NativeRegistryCreateFn = unsafe extern "C" fn(*const c_char, *mut *mut c_void) -> c_int;
+type NativeRegistryFreeFn = unsafe extern "C" fn(*mut c_void);
+type NativeFamilyCountFn = unsafe extern "C" fn(*const c_void) -> usize;
+type NativeFamilyFn = unsafe extern "C" fn(*const c_void, usize, *mut *const c_char) -> c_int;
+type NativeTaskCountFn = unsafe extern "C" fn() -> usize;
+type NativeTaskNameFn = unsafe extern "C" fn(usize) -> *const c_char;
+
+struct NativeRuntime {
+    _library: Library,
+    abi_version: NativeAbiVersionFn,
+    build_version: NativeStringFn,
+    last_error: NativeStringFn,
+    status_string: NativeStatusStringFn,
+    registry_create: NativeRegistryCreateFn,
+    registry_free: NativeRegistryFreeFn,
+    family_count: NativeFamilyCountFn,
+    family: NativeFamilyFn,
+    task_count: NativeTaskCountFn,
+    task_name: NativeTaskNameFn,
+}
+
+impl NativeRuntime {
+    fn load(path: &Path) -> Result<Self> {
+        let library = open_native_library(path)?;
+        let abi_version: NativeAbiVersionFn = load_native_symbol(&library, "audiocpp_abi_version")?;
+
+        Ok(Self {
+            abi_version,
+            build_version: load_native_symbol(&library, "audiocpp_build_version")?,
+            last_error: load_native_symbol(&library, "audiocpp_last_error")?,
+            status_string: load_native_symbol(&library, "audiocpp_status_string")?,
+            registry_create: load_native_symbol(&library, "audiocpp_registry_create")?,
+            registry_free: load_native_symbol(&library, "audiocpp_registry_free")?,
+            family_count: load_native_symbol(&library, "audiocpp_registry_family_count")?,
+            family: load_native_symbol(&library, "audiocpp_registry_family")?,
+            task_count: load_native_symbol(&library, "audiocpp_task_count")?,
+            task_name: load_native_symbol(&library, "audiocpp_task_name")?,
+            _library: library,
+        })
+    }
+
+    fn describe_status(&self, status: c_int) -> String {
+        let message = borrowed_string(unsafe { (self.last_error)() });
+        let label = borrowed_string(unsafe { (self.status_string)(status) });
+        if message.is_empty() {
+            format!("{label} ({status})")
+        } else {
+            format!("{message} ({label})")
+        }
+    }
+
+    fn families(&self) -> Result<Vec<String>> {
+        let mut registry: *mut c_void = std::ptr::null_mut();
+        let status = unsafe { (self.registry_create)(std::ptr::null(), &mut registry) };
+        if status != AUDIOCPP_OK {
+            bail!(
+                "failed to create native registry: {}",
+                self.describe_status(status)
+            );
+        }
+
+        let collected = (|| -> Result<Vec<String>> {
+            let count = unsafe { (self.family_count)(registry) };
+            if count > MAX_NATIVE_FAMILIES {
+                bail!("native library reported {count} families; refusing to enumerate");
+            }
+
+            let mut families = Vec::with_capacity(count);
+            for index in 0..count {
+                let mut name: *const c_char = std::ptr::null();
+                let status = unsafe { (self.family)(registry, index, &mut name) };
+                if status != AUDIOCPP_OK {
+                    bail!(
+                        "failed to read native family at index {index}: {}",
+                        self.describe_status(status)
+                    );
+                }
+                families.push(borrowed_string(name));
+            }
+            Ok(families)
+        })();
+
+        unsafe { (self.registry_free)(registry) };
+        collected
+    }
+
+    fn tasks(&self) -> Vec<String> {
+        let count = unsafe { (self.task_count)() }.min(MAX_NATIVE_TASKS);
+        (0..count)
+            .map(|index| borrowed_string(unsafe { (self.task_name)(index) }))
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+}
+
+fn open_native_library(path: &Path) -> Result<Library> {
+    // SAFETY: the library path is user-supplied. Symbols are loaded with the exact
+    // C signatures from audiocpp.h, and the ABI major is checked here before any
+    // other entry point is resolved or called.
+    let library = unsafe { Library::new(path) }.with_context(|| {
+        format!(
+            "failed to load native audio.cpp library at '{}'; pass --native-lib PATH or set {AUDIOCPP_LIB_ENV}",
+            path.display()
+        )
+    })?;
+
+    let abi_version: NativeAbiVersionFn = load_native_symbol(&library, "audiocpp_abi_version")?;
+    ensure_compatible_abi(abi_parts(unsafe { abi_version() }).0)?;
+    Ok(library)
+}
+
+fn load_native_symbol<T: Copy>(library: &Library, name: &'static str) -> Result<T> {
+    // SAFETY: the caller supplies the matching C signature for this symbol.
+    unsafe { library.get::<T>(name.as_bytes()) }
+        .map(|symbol| *symbol)
+        .with_context(|| format!("native audio.cpp library is missing symbol '{name}'"))
+}
+
+fn borrowed_string(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    // SAFETY: audiocpp.h guarantees returned strings are NUL-terminated and borrowed
+    // until the producing handle is mutated or freed; this copies immediately.
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn abi_parts(version: u32) -> (u32, u32, u32) {
+    (
+        (version >> 16) & 0xff,
+        (version >> 8) & 0xff,
+        version & 0xff,
+    )
+}
+
+fn ensure_compatible_abi(major: u32) -> Result<()> {
+    if major != AUDIOCPP_ABI_MAJOR {
+        bail!(
+            "native library ABI major {major} is incompatible with this build (expected {AUDIOCPP_ABI_MAJOR}); install a matching audio.cpp build"
+        );
+    }
+    Ok(())
+}
+
+fn default_native_lib_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "audiocpp.dll"
+    } else if cfg!(target_os = "macos") {
+        "libaudiocpp.dylib"
+    } else {
+        "libaudiocpp.so"
+    }
+}
+
+fn resolve_native_lib_path(explicit: Option<&Path>) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    if let Some(path) = std::env::var_os(AUDIOCPP_LIB_ENV) {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(default_native_lib_name())
+}
+
+fn probe_native_runtime(args: &NativeProbeArgs) -> Result<()> {
+    let library_path = resolve_native_lib_path(args.native_lib.as_deref());
+    let runtime = NativeRuntime::load(&library_path)?;
+
+    let (major, minor, patch) = abi_parts(unsafe { (runtime.abi_version)() });
+
+    let mut report = vec![
+        format!("Library: {}", library_path.display()),
+        format!(
+            "audio.cpp build: {}",
+            borrowed_string(unsafe { (runtime.build_version)() })
+        ),
+        format!("ABI: {major}.{minor}.{patch}"),
+    ];
+
+    let mut families = runtime.families()?;
+    families.sort();
+    report.push(format!(
+        "Families ({}): {}",
+        families.len(),
+        families.join(", ")
+    ));
+    for family in ["kitten_tts", "kitten_tts2"] {
+        report.push(format!(
+            "{family}: {}",
+            if families.iter().any(|name| name == family) {
+                "available"
+            } else {
+                "not available"
+            }
+        ));
+    }
+
+    let tasks = runtime.tasks();
+    report.push(format!("Tasks ({}): {}", tasks.len(), tasks.join(", ")));
+    write_stdout(&(report.join("\n") + "\n"))?;
+
+    if let Some(requested) = &args.family
+        && !families.iter().any(|name| name == requested)
+    {
+        let available = if families.is_empty() {
+            "none".to_string()
+        } else {
+            families.join(", ")
+        };
+        bail!(
+            "family '{requested}' is not available in this native library (available: {available})"
+        );
+    }
+
+    Ok(())
+}
+
+#[repr(C)]
+struct NativeModelConfig {
+    family_hint: *const c_char,
+    config_id: *const c_char,
+    weight_id: *const c_char,
+    model_spec_override: *const c_char,
+}
+
+#[repr(C)]
+struct NativeBackendConfig {
+    backend: *const c_char,
+    device: c_int,
+    threads: c_int,
+}
+
+type NativeModelLoadFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const c_char,
+    *const NativeModelConfig,
+    *const c_void,
+    *mut *mut c_void,
+) -> c_int;
+type NativeSessionCreateFn = unsafe extern "C" fn(
+    *const c_void,
+    *const c_char,
+    *const c_char,
+    *const NativeBackendConfig,
+    *const c_void,
+    *mut *mut c_void,
+) -> c_int;
+type NativeRunFn = unsafe extern "C" fn(*mut c_void, *const c_void, *mut *mut c_void) -> c_int;
+type NativeResultAudioFn = unsafe extern "C" fn(
+    *const c_void,
+    *mut *const f32,
+    *mut usize,
+    *mut c_int,
+    *mut c_int,
+) -> c_int;
+type NativeVoidHandleFn = unsafe extern "C" fn(*mut c_void);
+type NativeHandleFn = unsafe extern "C" fn() -> *mut c_void;
+type NativeRequestSetTextFn =
+    unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
+type NativeRequestSetStrFn = unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int;
+type NativeRequestSetRateFn = unsafe extern "C" fn(*mut c_void, f32) -> c_int;
+type NativeRequestSetOptionFn =
+    unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
+
+struct NativeSynth {
+    _library: Library,
+    last_error: NativeStringFn,
+    status_string: NativeStatusStringFn,
+    registry_create: NativeRegistryCreateFn,
+    registry_free: NativeRegistryFreeFn,
+    model_load: NativeModelLoadFn,
+    model_free: NativeVoidHandleFn,
+    session_create: NativeSessionCreateFn,
+    session_free: NativeVoidHandleFn,
+    session_run: NativeRunFn,
+    request_create: NativeHandleFn,
+    request_free: NativeVoidHandleFn,
+    request_set_text: NativeRequestSetTextFn,
+    request_set_voice: NativeRequestSetStrFn,
+    request_set_rate: NativeRequestSetRateFn,
+    request_set_option: NativeRequestSetOptionFn,
+    result_audio: NativeResultAudioFn,
+    result_free: NativeVoidHandleFn,
+    options_create: NativeHandleFn,
+    options_set: NativeRequestSetOptionFn,
+    options_free: NativeVoidHandleFn,
+    registry: *mut c_void,
+    options: *mut c_void,
+    model: *mut c_void,
+    session: *mut c_void,
+    family: NativeFamily,
+    random_voice_state_path: PathBuf,
+}
+
+impl Drop for NativeSynth {
+    fn drop(&mut self) {
+        // SAFETY: each handle was produced by this library and is freed at most
+        // once here. audiocpp treats a NULL handle free as a no-op.
+        unsafe {
+            if !self.session.is_null() {
+                (self.session_free)(self.session);
+            }
+            if !self.options.is_null() {
+                (self.options_free)(self.options);
+            }
+            if !self.model.is_null() {
+                (self.model_free)(self.model);
+            }
+            if !self.registry.is_null() {
+                (self.registry_free)(self.registry);
+            }
+        }
+    }
+}
+
+struct NativeOpenConfig<'a> {
+    library_path: &'a Path,
+    family: NativeFamily,
+    backend: NativeBackend,
+    threads: i32,
+    model_path: &'a Path,
+    cache_root: &'a Path,
+    espeak_lib: Option<&'a Path>,
+    espeak_data: Option<&'a Path>,
+}
+
+impl NativeSynth {
+    fn open(config: NativeOpenConfig<'_>) -> Result<Self> {
+        let NativeOpenConfig {
+            library_path,
+            family,
+            backend,
+            threads,
+            model_path,
+            cache_root,
+            espeak_lib,
+            espeak_data,
+        } = config;
+        let library = open_native_library(library_path)?;
+        let mut synthesizer = Self {
+            last_error: load_native_symbol(&library, "audiocpp_last_error")?,
+            status_string: load_native_symbol(&library, "audiocpp_status_string")?,
+            registry_create: load_native_symbol(&library, "audiocpp_registry_create")?,
+            registry_free: load_native_symbol(&library, "audiocpp_registry_free")?,
+            model_load: load_native_symbol(&library, "audiocpp_model_load")?,
+            model_free: load_native_symbol(&library, "audiocpp_model_free")?,
+            session_create: load_native_symbol(&library, "audiocpp_session_create")?,
+            session_free: load_native_symbol(&library, "audiocpp_session_free")?,
+            session_run: load_native_symbol(&library, "audiocpp_session_run")?,
+            request_create: load_native_symbol(&library, "audiocpp_request_create")?,
+            request_free: load_native_symbol(&library, "audiocpp_request_free")?,
+            request_set_text: load_native_symbol(&library, "audiocpp_request_set_text")?,
+            request_set_voice: load_native_symbol(&library, "audiocpp_request_set_voice_id")?,
+            request_set_rate: load_native_symbol(&library, "audiocpp_request_set_speaking_rate")?,
+            request_set_option: load_native_symbol(&library, "audiocpp_request_set_option")?,
+            result_audio: load_native_symbol(&library, "audiocpp_result_audio")?,
+            result_free: load_native_symbol(&library, "audiocpp_result_free")?,
+            options_create: load_native_symbol(&library, "audiocpp_options_create")?,
+            options_set: load_native_symbol(&library, "audiocpp_options_set")?,
+            options_free: load_native_symbol(&library, "audiocpp_options_free")?,
+            registry: std::ptr::null_mut(),
+            options: std::ptr::null_mut(),
+            model: std::ptr::null_mut(),
+            session: std::ptr::null_mut(),
+            family,
+            random_voice_state_path: cache_root.join("last_random_voice.txt"),
+            _library: library,
+        };
+
+        let mut registry: *mut c_void = std::ptr::null_mut();
+        synthesizer.check_status(
+            unsafe { (synthesizer.registry_create)(std::ptr::null(), &mut registry) },
+            "failed to create native registry",
+        )?;
+        synthesizer.registry = registry;
+
+        let family_name = c_string(family.as_str())?;
+        let model_path = model_path.to_str().ok_or_else(|| {
+            anyhow!(
+                "native model path is not valid UTF-8: {}",
+                model_path.display()
+            )
+        })?;
+        let model_path = c_string(model_path)?;
+        let model_config = NativeModelConfig {
+            family_hint: family_name.as_ptr(),
+            config_id: std::ptr::null(),
+            weight_id: std::ptr::null(),
+            model_spec_override: std::ptr::null(),
+        };
+        let mut model: *mut c_void = std::ptr::null_mut();
+        synthesizer.check_status(
+            unsafe {
+                (synthesizer.model_load)(
+                    synthesizer.registry,
+                    model_path.as_ptr(),
+                    &model_config,
+                    std::ptr::null(),
+                    &mut model,
+                )
+            },
+            "failed to load native model",
+        )?;
+        synthesizer.model = model;
+
+        let espeak_lib = espeak_lib.map(path_to_c_string).transpose()?;
+        let espeak_data = espeak_data.map(path_to_c_string).transpose()?;
+        if espeak_lib.is_some() || espeak_data.is_some() {
+            let options = unsafe { (synthesizer.options_create)() };
+            if options.is_null() {
+                bail!("native engine failed to create session options");
+            }
+            synthesizer.options = options;
+            let set_option = |key: &str, value: &CString| -> Result<()> {
+                let key = c_string(key)?;
+                synthesizer.check_status(
+                    unsafe { (synthesizer.options_set)(options, key.as_ptr(), value.as_ptr()) },
+                    "failed to set native session option",
+                )
+            };
+            if let Some(value) = &espeak_lib {
+                set_option("kitten_tts.espeak_library_path", value)?;
+            }
+            if let Some(value) = &espeak_data {
+                set_option("kitten_tts.espeak_data_path", value)?;
+            }
+        }
+
+        let task = c_string("tts")?;
+        let mode = c_string("offline")?;
+        let candidates = backend.candidates(family);
+        let attempt_count = candidates.len();
+        let mut session_error = None;
+        for backend_name in candidates {
+            let backend_name_c = c_string(backend_name)?;
+            let backend_config = NativeBackendConfig {
+                backend: backend_name_c.as_ptr(),
+                device: 0,
+                threads,
+            };
+            let mut session: *mut c_void = std::ptr::null_mut();
+            let status = unsafe {
+                (synthesizer.session_create)(
+                    synthesizer.model,
+                    task.as_ptr(),
+                    mode.as_ptr(),
+                    &backend_config,
+                    synthesizer.options,
+                    &mut session,
+                )
+            };
+            if status == AUDIOCPP_OK {
+                eprintln!("[Native] backend={backend_name}");
+                synthesizer.session = session;
+                break;
+            }
+            let message = synthesizer.describe_status(status);
+            if attempt_count > 1 {
+                eprintln!("[Native] backend={backend_name} unavailable: {message}");
+            }
+            session_error = Some(message);
+        }
+        if synthesizer.session.is_null() {
+            bail!(
+                "failed to create native session: {}",
+                session_error.unwrap_or_else(|| "no backend available".to_string())
+            );
+        }
+
+        if let Some(path) = espeak_lib {
+            eprintln!("[Native] espeak-ng library={}", path.to_string_lossy());
+        }
+        if let Some(path) = espeak_data {
+            eprintln!("[Native] espeak-ng data={}", path.to_string_lossy());
+        }
+
+        Ok(synthesizer)
+    }
+
+    fn describe_status(&self, status: c_int) -> String {
+        let message = borrowed_string(unsafe { (self.last_error)() });
+        let label = borrowed_string(unsafe { (self.status_string)(status) });
+        if message.is_empty() {
+            format!("{label} ({status})")
+        } else {
+            format!("{message} ({label})")
+        }
+    }
+
+    fn check_status(&self, status: c_int, action: &str) -> Result<()> {
+        if status == AUDIOCPP_OK {
+            return Ok(());
+        }
+        bail!("{action}: {}", self.describe_status(status))
+    }
+
+    fn synthesize(
+        &mut self,
+        text: &str,
+        voice: Option<&str>,
+        config: SynthesisConfig,
+    ) -> Result<Vec<f32>> {
+        let mut output = Vec::new();
+        self.synthesize_streaming(text, voice, config, |chunk| {
+            output.extend_from_slice(chunk);
+            Ok(())
+        })?;
+        Ok(output)
+    }
+
+    fn synthesize_streaming(
+        &mut self,
+        text: &str,
+        voice: Option<&str>,
+        config: SynthesisConfig,
+        mut on_chunk: impl FnMut(&[f32]) -> Result<()>,
+    ) -> Result<()> {
+        let chunks = prepare_native_chunks(text, config.speed, config.max_chars)?;
+        let resolved_voice = self.resolve_voice(voice, config.seed)?;
+
+        let started = Instant::now();
+        let mut total_samples = 0usize;
+        let mut first_audio = None;
+        for chunk in chunks {
+            let audio =
+                self.run_chunk(&chunk, resolved_voice.as_deref(), config.speed, config.seed)?;
+            if first_audio.is_none() {
+                first_audio = Some(started.elapsed());
+            }
+            total_samples += audio.len();
+            on_chunk(&audio)?;
+        }
+        eprintln!(
+            "[Native] synthesized {total_samples} samples in {:.2}s (first audio {} ms)",
+            started.elapsed().as_secs_f64(),
+            first_audio.map(|d| d.as_millis()).unwrap_or(0)
+        );
+        Ok(())
+    }
+
+    fn resolve_voice(&self, voice: Option<&str>, seed: Option<u64>) -> Result<Option<String>> {
+        if let Some(voice) = voice {
+            let trimmed = voice.trim();
+            if trimmed.is_empty() {
+                bail!("voice name cannot be empty");
+            }
+            return Ok(Some(trimmed.to_string()));
+        }
+
+        let canonical = self.family.canonical_voices();
+        if canonical.is_empty() {
+            eprintln!("[Native] using the model's default voice");
+            return Ok(None);
+        }
+
+        let mut rng = SimpleRng::from_seed(seed.unwrap_or_else(runtime_entropy_seed));
+        let previous = load_last_random_voice(&self.random_voice_state_path);
+        let mut candidates = canonical.to_vec();
+        if let Some(previous) = previous
+            && candidates.len() > 1
+        {
+            candidates.retain(|candidate| *candidate != previous.as_str());
+        }
+        let selected = candidates[rng.gen_index(candidates.len())].to_string();
+        if let Err(err) = store_last_random_voice(&self.random_voice_state_path, &selected) {
+            eprintln!(
+                "warning: could not persist last random voice to {}: {err}",
+                self.random_voice_state_path.display()
+            );
+        }
+        eprintln!("using random voice: {selected}");
+        Ok(Some(selected))
+    }
+
+    fn run_chunk(
+        &mut self,
+        text: &str,
+        voice: Option<&str>,
+        speed: f32,
+        seed: Option<u64>,
+    ) -> Result<Vec<f32>> {
+        let request = unsafe { (self.request_create)() };
+        if request.is_null() {
+            bail!("native engine failed to create a request");
+        }
+
+        let mut result: *mut c_void = std::ptr::null_mut();
+        let audio = (|| -> Result<Vec<f32>> {
+            let text = c_string(text)?;
+            self.check_status(
+                unsafe { (self.request_set_text)(request, text.as_ptr(), std::ptr::null()) },
+                "failed to set native request text",
+            )?;
+
+            if let Some(voice) = voice {
+                let voice = c_string(voice)?;
+                if let Err(err) = self.check_status(
+                    unsafe { (self.request_set_voice)(request, voice.as_ptr()) },
+                    "failed to set native request voice",
+                ) {
+                    if self.family == NativeFamily::KittenTts {
+                        return Err(err.context(format!(
+                            "available kitten_tts voices: {}",
+                            NATIVE_KITTEN_TTS_VOICES.join(", ")
+                        )));
+                    }
+                    return Err(err);
+                }
+            }
+
+            if native_applies_speed(self.family, speed) {
+                self.check_status(
+                    unsafe { (self.request_set_rate)(request, speed) },
+                    "failed to set native speaking rate",
+                )?;
+            }
+
+            if let Some(seed) = seed {
+                let key = c_string("seed")?;
+                let value = c_string(&seed.to_string())?;
+                self.check_status(
+                    unsafe { (self.request_set_option)(request, key.as_ptr(), value.as_ptr()) },
+                    "failed to set native request seed",
+                )?;
+            }
+
+            if let Err(err) = self.check_status(
+                unsafe { (self.session_run)(self.session, request, &mut result) },
+                "native synthesis failed",
+            ) {
+                if self.family == NativeFamily::KittenTts {
+                    return Err(err.context(format!(
+                        "available kitten_tts voices: {}",
+                        NATIVE_KITTEN_TTS_VOICES.join(", ")
+                    )));
+                }
+                return Err(err);
+            }
+            if result.is_null() {
+                bail!("native engine returned no result");
+            }
+
+            let mut samples: *const f32 = std::ptr::null();
+            let mut frames = 0usize;
+            let mut sample_rate: c_int = 0;
+            let mut channels: c_int = 0;
+            self.check_status(
+                unsafe {
+                    (self.result_audio)(
+                        result,
+                        &mut samples,
+                        &mut frames,
+                        &mut sample_rate,
+                        &mut channels,
+                    )
+                },
+                "failed to read native result audio",
+            )?;
+            if samples.is_null() || frames == 0 {
+                bail!("native engine produced no audio");
+            }
+            if channels <= 0 {
+                bail!("native engine reported an invalid channel count: {channels}");
+            }
+            if sample_rate <= 0 {
+                bail!("native engine reported an invalid sample rate: {sample_rate}");
+            }
+
+            let channels = channels as usize;
+            let total = frames
+                .checked_mul(channels)
+                .ok_or_else(|| anyhow!("native audio size overflow"))?;
+            // SAFETY: the ABI returns `frames * channels` interleaved f32 samples that
+            // stay valid until the result is freed, which happens after this copy.
+            let raw = unsafe { std::slice::from_raw_parts(samples, total) };
+            let audio: Vec<f32> = if channels == 1 {
+                raw.to_vec()
+            } else {
+                raw.chunks_exact(channels)
+                    .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+                    .collect()
+            };
+
+            if let Some(index) = audio.iter().position(|sample| !sample.is_finite()) {
+                bail!(
+                    "native backend produced non-finite audio at sample {index}; this backend may not support the model family. Retry with --native-backend cpu"
+                );
+            }
+            if audio.iter().all(|sample| sample.abs() < 1e-6) {
+                bail!(
+                    "native backend produced silent audio; this backend may not support the model family. Retry with --native-backend cpu"
+                );
+            }
+
+            Ok(audio)
+        })();
+
+        // SAFETY: both handles are either NULL or owned here, and freeing NULL is a no-op.
+        unsafe {
+            (self.result_free)(result);
+            (self.request_free)(request);
+        }
+        audio
+    }
+}
+
+fn write_stdout(text: &str) -> Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|_| stdout.flush())
+    {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(err).context("failed writing to stdout"),
+    }
+}
+
+fn native_applies_speed(family: NativeFamily, speed: f32) -> bool {
+    family == NativeFamily::KittenTts && (speed - 1.0).abs() > 1e-6
+}
+
+fn c_string(value: &str) -> Result<CString> {
+    CString::new(value).map_err(|_| anyhow!("value contains a NUL byte: {value}"))
+}
+
+fn path_to_c_string(path: &Path) -> Result<CString> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))?;
+    c_string(path)
 }
 
 fn main() -> Result<()> {
@@ -1729,6 +2904,9 @@ fn main() -> Result<()> {
                     );
                 }
             }
+        },
+        Commands::Native(native_cmd) => match native_cmd.command {
+            NativeCommands::Probe(args) => probe_native_runtime(&args)?,
         },
         Commands::Model(model_cmd) => {
             let client = build_http_client()?;
@@ -1776,15 +2954,10 @@ fn main() -> Result<()> {
             }
         }
         Commands::Play(args) => {
-            let (text, mut synthesizer, phonemizer) = prepare_synthesis_runtime(&args.synthesis)?;
+            let (text, mut backend) = prepare_synthesis_runtime(&args.synthesis)?;
             let config = SynthesisConfig::from(&args.synthesis);
 
-            let audio = synthesizer.synthesize(
-                &text,
-                args.synthesis.voice.as_deref(),
-                config,
-                phonemizer.as_ref(),
-            )?;
+            let audio = backend.synthesize(&text, args.synthesis.voice.as_deref(), config)?;
             play_audio(
                 &audio,
                 args.synthesis.sample_rate,
@@ -1794,15 +2967,10 @@ fn main() -> Result<()> {
             )?;
         }
         Commands::Synthesize(args) => {
-            let (text, mut synthesizer, phonemizer) = prepare_synthesis_runtime(&args.synthesis)?;
+            let (text, mut backend) = prepare_synthesis_runtime(&args.synthesis)?;
             let config = SynthesisConfig::from(&args.synthesis);
 
-            let audio = synthesizer.synthesize(
-                &text,
-                args.synthesis.voice.as_deref(),
-                config,
-                phonemizer.as_ref(),
-            )?;
+            let audio = backend.synthesize(&text, args.synthesis.voice.as_deref(), config)?;
 
             write_wav(
                 &args.output,
@@ -1813,16 +2981,15 @@ fn main() -> Result<()> {
             eprintln!("wrote {} samples to {}", audio.len(), args.output.display());
         }
         Commands::Stream(args) => {
-            let (text, mut synthesizer, phonemizer) = prepare_synthesis_runtime(&args.synthesis)?;
+            let (text, mut backend) = prepare_synthesis_runtime(&args.synthesis)?;
             let config = SynthesisConfig::from(&args.synthesis);
 
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
-            synthesizer.synthesize_streaming(
+            backend.synthesize_streaming(
                 &text,
                 args.synthesis.voice.as_deref(),
                 config,
-                phonemizer.as_ref(),
                 |chunk| {
                     for sample in chunk {
                         stdout.write_all(&sample.to_le_bytes())?;
@@ -2100,5 +3267,188 @@ mod tests {
         let resolved = resolve_session_config(&cfg);
         assert!(!resolved.parallel_execution);
         assert_eq!(resolved.inter_threads, SAFE_INTER_THREADS);
+    }
+
+    #[test]
+    fn native_abi_unpacks_major_minor_patch() {
+        assert_eq!(abi_parts((1 << 16) | (2 << 8) | 3), (1, 2, 3));
+        assert_eq!(abi_parts(0), (0, 0, 0));
+    }
+
+    #[test]
+    fn native_abi_major_mismatch_is_rejected() {
+        let err = ensure_compatible_abi(AUDIOCPP_ABI_MAJOR + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("incompatible"), "{err}");
+    }
+
+    #[test]
+    fn native_abi_current_major_is_accepted() {
+        assert!(ensure_compatible_abi(AUDIOCPP_ABI_MAJOR).is_ok());
+    }
+
+    #[test]
+    fn native_lib_path_prefers_explicit_argument() {
+        let path = resolve_native_lib_path(Some(Path::new("/custom/libaudiocpp.so")));
+        assert_eq!(path, PathBuf::from("/custom/libaudiocpp.so"));
+    }
+
+    #[test]
+    fn native_loader_reports_missing_library() {
+        let err = NativeRuntime::load(Path::new("/nonexistent/libaudiocpp-missing.so"))
+            .err()
+            .expect("missing library should fail")
+            .to_string();
+        assert!(
+            err.contains("failed to load native audio.cpp library"),
+            "{err}"
+        );
+    }
+
+    fn parse_synthesis_args(extra: &[&str]) -> SynthesisArgs {
+        let mut argv = vec!["kitten-tts", "synthesize", "--text", "hello"];
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(argv).expect("valid cli");
+        match cli.command {
+            Commands::Synthesize(args) => args.synthesis,
+            _ => panic!("expected synthesize command"),
+        }
+    }
+
+    #[test]
+    fn engine_defaults_to_auto() {
+        assert_eq!(parse_synthesis_args(&[]).engine, EngineChoice::Auto);
+    }
+
+    #[test]
+    fn auto_engine_is_opportunistic_only_for_mini() {
+        assert_eq!(
+            auto_native_intent(&parse_synthesis_args(&[])),
+            AutoNativeIntent::None
+        );
+        assert_eq!(
+            auto_native_intent(&parse_synthesis_args(&["--model", "mini-0.8"])),
+            AutoNativeIntent::Opportunistic
+        );
+    }
+
+    #[test]
+    fn auto_engine_honours_explicit_native_intent() {
+        assert_eq!(
+            auto_native_intent(&parse_synthesis_args(&[
+                "--native-model",
+                "/tmp/model.gguf"
+            ])),
+            AutoNativeIntent::Required
+        );
+        assert_eq!(
+            auto_native_intent(&parse_synthesis_args(&["--native-family", "kitten_tts2"])),
+            AutoNativeIntent::Required
+        );
+    }
+
+    #[test]
+    fn native_threads_must_be_positive() {
+        let args = parse_synthesis_args(&["--engine", "native", "--native-threads", "0"]);
+        let err = validate_native_args(&args).unwrap_err().to_string();
+        assert!(err.contains("between 1 and 256"), "{err}");
+    }
+
+    #[test]
+    fn native_rejects_style_index() {
+        let args = parse_synthesis_args(&["--engine", "native", "--style-index", "3"]);
+        let err = validate_native_args(&args).unwrap_err().to_string();
+        assert!(err.contains("--style-index"), "{err}");
+    }
+
+    #[test]
+    fn native_rejects_non_mini_preset_without_override() {
+        let args = parse_synthesis_args(&["--engine", "native", "--model", "nano-0.8-fp32"]);
+        let err = validate_native_args(&args).unwrap_err().to_string();
+        assert!(err.contains("Mini 0.8"), "{err}");
+    }
+
+    #[test]
+    fn native_kitten_tts2_requires_license_acknowledgement() {
+        let args = parse_synthesis_args(&[
+            "--engine",
+            "native",
+            "--native-family",
+            "kitten_tts2",
+            "--native-model",
+            "/tmp/kitten-tts2.gguf",
+        ]);
+        let err = validate_native_args(&args).unwrap_err().to_string();
+        assert!(err.contains("Stellon Labs"), "{err}");
+    }
+
+    #[test]
+    fn native_kitten_tts2_accepts_license_and_local_model() {
+        let args = parse_synthesis_args(&[
+            "--engine",
+            "native",
+            "--native-family",
+            "kitten_tts2",
+            "--native-model",
+            "/tmp/kitten-tts2.gguf",
+            "--accept-kitten2-license",
+        ]);
+        assert!(validate_native_args(&args).is_ok());
+    }
+
+    #[test]
+    fn synthesis_guardrails_apply_to_shared_chunking() {
+        let err = prepare_synthesis_chunks("hello", 9.0, 400)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("speed must be between"), "{err}");
+    }
+
+    #[test]
+    fn native_auto_backend_is_cpu_for_kitten_tts() {
+        assert_eq!(
+            NativeBackend::Auto.candidates(NativeFamily::KittenTts),
+            vec!["cpu"]
+        );
+    }
+
+    #[test]
+    fn native_auto_backend_ends_with_cpu() {
+        let candidates = NativeBackend::Auto.candidates(NativeFamily::KittenTts2);
+        assert_eq!(candidates.last().copied(), Some("cpu"));
+    }
+
+    #[test]
+    fn native_chunking_keeps_short_text_in_one_request() {
+        let chunks = prepare_native_chunks("First sentence. Second sentence.", 1.0, 400)
+            .expect("valid chunks");
+        assert_eq!(chunks, vec!["First sentence. Second sentence."]);
+    }
+
+    #[test]
+    fn native_chunking_splits_text_above_max_chars() {
+        let text = "This is a long first sentence for the test. This is a long second sentence for the test.";
+        let chunks = prepare_native_chunks(text, 1.0, 30).expect("valid chunks");
+        assert!(chunks.len() > 1, "{chunks:?}");
+    }
+
+    #[test]
+    fn native_speed_only_applies_to_kitten_tts() {
+        assert!(native_applies_speed(NativeFamily::KittenTts, 1.5));
+        assert!(!native_applies_speed(NativeFamily::KittenTts, 1.0));
+        assert!(!native_applies_speed(NativeFamily::KittenTts2, 1.5));
+    }
+
+    #[test]
+    fn explicit_native_espeak_path_must_exist() {
+        let err = resolve_espeak_path(
+            Some(Path::new("/nonexistent/libespeak-ng.dylib")),
+            detect_espeak_library,
+            "libespeak-ng",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not exist"), "{err}");
     }
 }

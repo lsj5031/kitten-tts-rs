@@ -4,7 +4,7 @@ Fast Rust CLI for KittenTTS ONNX models.
 
 ## Why This CLI
 
-- Pure Rust inference with ONNX Runtime
+- Pure Rust inference with ONNX Runtime, plus an optional native audio.cpp engine
 - First-run model download and local cache
 - Multi-model support with presets or custom Hugging Face repo
 - WAV output, raw stream output, and direct speaker playback
@@ -14,12 +14,13 @@ Fast Rust CLI for KittenTTS ONNX models.
 ## Defaults
 
 - Default model: `KittenML/kitten-tts-nano-0.8-fp32`
+- Default engine: `auto` (native only when it can serve the request, else ONNX Runtime)
 - Default voice: random canonical voice (unless `--voice` is set)
 - Default style: random style row (unless `--style-index` is set)
 - Sample rate: `24000`
 - Output: `output.wav` for `synthesize`
 - Playback gain (`play`): `2.5x` with anti-clipping limiter enabled
-- GPU runtime: CUDA execution provider is required; startup fails if CUDA is unavailable
+- ONNX path runtime: CUDA execution provider is required; startup fails if CUDA is unavailable
 - CUDA session defaults: arena strategy `same-as-requested`, conv algo `heuristic`, graph opt level 1, memory pattern off, parallel execution off
 - VRAM profiles (`--vram-profile`): `minimal` / `balanced` / `performance` — curated presets that override individual session flags
 - ONNX Runtime is loaded dynamically from:
@@ -32,7 +33,7 @@ Fast Rust CLI for KittenTTS ONNX models.
 
 ## CUDA / ORT Setup
 
-This CLI is GPU-only. You must provide a CUDA-enabled ONNX Runtime shared library and matching CUDA/cuDNN runtime libs.
+The ONNX Runtime path is GPU-only. You must provide a CUDA-enabled ONNX Runtime shared library and matching CUDA/cuDNN runtime libs. The optional native engine does not use ONNX Runtime.
 
 Example:
 
@@ -153,6 +154,99 @@ kitten-tts stream \
   --trim-tail 0 \
 | ffplay -autoexit -nodisp -loglevel error -f f32le -ar 24000 -ch_layout mono -
 ```
+
+## Native Engine (optional)
+
+Synthesis can also run through the [audio.cpp](https://github.com/0xShug0/audio.cpp)
+C API instead of ONNX Runtime. It is opt-in and leaves the ONNX defaults alone.
+The evaluation, decision and measurements live in
+[docs/native-backend-evaluation.md](docs/native-backend-evaluation.md).
+
+Requirements:
+
+- audio.cpp C API library v0.9.2 or newer (`--native-lib` or `AUDIOCPP_LIB`)
+- `libespeak-ng` for the KittenTTS 0.8 frontend (`--native-espeak-lib` and
+  `--native-espeak-data`, or auto-detected under Homebrew/system paths)
+- KittenTTS Mini 0.8 GGUF, downloaded on first use (~288 MiB) into the cache, or
+  passed with `--native-model /path/to.gguf`
+
+```bash
+kitten-tts synthesize \
+  --text "Hello from the native engine" \
+  --engine native \
+  --model mini-0.8 \
+  --native-lib /path/to/libaudiocpp.dylib \
+  --native-backend cpu \
+  --native-threads 8 \
+  --native-espeak-lib /opt/homebrew/lib/libespeak-ng.dylib \
+  --native-espeak-data /opt/homebrew/share/espeak-ng-data \
+  --output native.wav
+```
+
+`--engine auto` is the default. It selects the native engine only when it can
+serve the request: `--model mini-0.8`, an explicit `--native-model`, or
+`--native-family kitten_tts2`. The default ONNX preset `nano-0.8-fp32` keeps
+using ONNX Runtime. `--engine native` always uses the native engine.
+
+Native notes:
+
+- Auto backend is `cpu` for `kitten_tts`, and `cuda` then `cpu` for `kitten_tts2`
+  on Linux/Windows. `--native-backend cuda|metal|vulkan|hip` overrides it.
+- Auto stays on `cpu` for `kitten_tts`. One early Metal run with the Mini 0.8
+  FP32 GGUF returned non-finite samples; it did not reproduce, and Metal was
+  faster in later tests (0.89 s vs 1.71 s for 6.59 s of audio at 8 threads).
+  Opt in with `--native-backend metal`. Silent or non-finite output is rejected
+  instead of written to disk.
+- `--style-index`, `--vram-profile`, and `--repo-id` are ONNX-only and rejected
+  on the native path.
+- `--trim-tail` and `--phonemizer` are ONNX-only. The native 0.8 frontend uses
+  its own eSpeak-ng, and the port trims its own output.
+- `--speed` maps to the native speaking rate for `kitten_tts` (verified against
+  upstream); `kitten_tts2` ignores it and prints a notice. `--seed` maps to the
+  native request seed. Streaming is per text chunk; these ports have no native
+  streaming session.
+- Native `kitten_tts` voices: `Bella`, `Jasper`, `Luna`, `Bruno`, `Rosie`, `Hugo`,
+  `Kiki`, `Leo`. Omit `--voice` for a random one. For `kitten_tts2`, pass a preset
+  from the package (`Bruno`, `German`, ...) or omit `--voice` for the engine
+  default.
+
+### KittenTTS 2 (opt-in)
+
+KittenTTS 2 runs only through the native engine, with a local GGUF, and requires
+acknowledging the
+[Stellon Labs Community License](https://huggingface.co/KittenML/kitten-tts-2/blob/main/LICENSE.md)
+(commercial registration and revenue/funding limits):
+
+```bash
+kitten-tts synthesize \
+  --text "Hello from KittenTTS 2" \
+  --engine native \
+  --native-family kitten_tts2 \
+  --native-model /path/to/kitten-tts2.gguf \
+  --accept-kitten2-license \
+  --native-lib /path/to/libaudiocpp.dylib \
+  --output v2.wav
+```
+
+v2 weights are not downloaded automatically and are not bundled. Validated here
+with the 2026-10-21 Q8 GGUF (3.34 GB) on macOS arm64 CPU: English and German
+presets, streaming, multi-chunk text and seeded determinism all work. Not
+validated: CUDA, cloning, the remaining language presets, or listening quality.
+The port ignores `--speed`; the CLI prints a notice when it is set.
+
+### Native probe
+
+Inspect a native library without synthesizing:
+
+```bash
+kitten-tts native probe --native-lib /path/to/libaudiocpp.dylib
+```
+
+The probe prints the audio.cpp build version, ABI version, registered model
+families and task vocabulary. It exits non-zero when the ABI major does not match,
+when a required symbol is missing, or when `--family` names an absent family. The
+library path can also come from `AUDIOCPP_LIB`, then falls back to the platform
+default name (`libaudiocpp.so`, `libaudiocpp.dylib`, `audiocpp.dll`).
 
 ## Voice and Tone Control
 

@@ -170,7 +170,13 @@ Examples:
   - `play` uses default `--gain 2.5`
   - anti-clipping limiter is enabled by default
   - `--allow-clipping` is available for manual/unsafe gain control
-- GPU-only runtime: CUDA execution provider is required; do not add CPU fallback paths.
+- ONNX path runtime: CUDA execution provider is required; do not add ORT CPU fallback paths.
+- Optional native engine (`--engine auto|onnx|native`):
+  - `auto` prefers audio.cpp only when it can serve the request (mini preset, explicit `--native-model`, or v2 family); default ONNX preset stays on ORT.
+  - `auto` backend is `cpu` for `kitten_tts`, and `cuda` then `cpu` for `kitten_tts2` on Linux/Windows; explicit GPU backends are opt-in.
+  - Reject silent or non-finite native output instead of writing WAVs.
+  - Never bundle GGUF weights or `libespeak-ng`; fetch weights to the cache and point at the user's library.
+  - KittenTTS 2 requires a local GGUF plus `--accept-kitten2-license`.
 - ONNX Runtime loading policy:
   - use dynamic loading (`load-dynamic`) with user/system-provided `libonnxruntime`
   - preserve `--ort-lib`, `--cuda-lib-dir`, and `--cudnn-lib-dir` CLI options

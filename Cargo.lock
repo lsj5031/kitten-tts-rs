@@ -698,6 +698,7 @@ dependencies = [
  "directories",
  "hex",
  "hound",
+ "libloading",
  "ndarray",
  "once_cell",
  "ort",
