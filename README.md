@@ -14,7 +14,7 @@ Fast Rust CLI for KittenTTS ONNX models.
 ## Defaults
 
 - Default model: `KittenML/kitten-tts-nano-0.8-fp32`
-- Default engine: `auto` (native only when it can serve the request, else ONNX Runtime)
+- Default engine: `auto` (on macOS the default request runs native; elsewhere native when it can serve the request, else ONNX Runtime)
 - Default voice: random canonical voice (unless `--voice` is set)
 - Default style: random style row (unless `--style-index` is set)
 - Sample rate: `24000`
@@ -183,10 +183,15 @@ kitten-tts synthesize \
   --output native.wav
 ```
 
-`--engine auto` is the default. It selects the native engine only when it can
-serve the request: `--model mini-0.8`, an explicit `--native-model`, or
-`--native-family kitten_tts2`. The default ONNX preset `nano-0.8-fp32` keeps
-using ONNX Runtime. `--engine native` always uses the native engine.
+`--engine auto` is the default. On macOS a plain request (no `--model` and no
+ONNX-only flags) runs on the native engine with the Mini 0.8 package, because
+the ONNX path requires CUDA and cannot run there; without the native library it
+prints a notice and falls back to ONNX Runtime. On every platform the native
+engine is selected when it can serve the request: `--model mini-0.8`, an
+explicit `--native-model`, or `--native-family kitten_tts2`. Explicit ONNX
+choices keep ONNX Runtime: `--model nano-0.8-fp32`, `--repo-id`,
+`--style-index`, `--vram-profile`, `--trim-tail`, `--phonemizer`, and the
+ORT/CUDA flags. `--engine native` always uses the native engine.
 
 Native notes:
 
@@ -211,8 +216,10 @@ Native notes:
   its own eSpeak-ng, and the port trims its own output.
 - `--speed` maps to the native speaking rate for `kitten_tts` (verified against
   upstream); `kitten_tts2` ignores it and prints a notice. `--seed` maps to the
-  native request seed. Streaming is per text chunk; these ports have no native
-  streaming session.
+  native request seed; the `kitten_tts2` port reads it as a signed 64-bit
+  integer, so values above 9223372036854775807 are rejected before the model
+  loads. Streaming is per text chunk; these ports have no native streaming
+  session.
 - Native `kitten_tts` voices: `Bella`, `Jasper`, `Luna`, `Bruno`, `Rosie`, `Hugo`,
   `Kiki`, `Leo`. Omit `--voice` for a random one. For `kitten_tts2`, pass a preset
   from the package (`Bruno`, `German`, ...) or omit `--voice` for the engine
@@ -258,6 +265,10 @@ kitten-tts native fetch --force                  # re-download even if cached
 ```
 
 It prints the resolved path, byte size and source URL, and needs no ONNX Runtime.
+Downloads are written to a temporary file and moved into the cache only after
+the byte count matches `Content-Length`; native models must also start with the
+GGUF magic, checked on download and on every reuse. A corrupt cached model is
+rejected with `native fetch --force` guidance instead of reaching the engine.
 `native fetch --family kitten_tts2` exits with an explanation instead of
 downloading, because v2 weights require a manual download and license
 acknowledgement. `kitten-tts models list` also prints the native download hint.
@@ -289,7 +300,7 @@ kitten-tts native doctor --cache-dir ./models
 
 It verifies the library loads, its ABI matches, the requested family is
 registered, the eSpeak library and data directory are discoverable (only for
-`kitten_tts`), and the model exists (the cached Mini 0.8 GGUF, or
+`kitten_tts`), and the model exists and is a GGUF (the cached Mini 0.8 GGUF, or
 `--native-model PATH`). Nothing is downloaded. Each line is `ok` or `FAILED`,
 the last line says whether the environment is ready, and the exit code is
 non-zero when any check fails. `--native-espeak-lib` and `--native-espeak-data`

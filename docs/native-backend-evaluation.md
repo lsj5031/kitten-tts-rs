@@ -32,10 +32,12 @@ Concretely:
 - **Reuse, don't rebuild.** No new model framework is written here. The native
   path is a binding to an existing engine.
 - **Implemented selection.** `--engine auto` (the default) uses the native engine
-  only when it can serve the request: `--model mini-0.8`, an explicit
-  `--native-model`, or `--native-family kitten_tts2`. The default ONNX preset
-  `nano-0.8-fp32` continues to use ONNX Runtime. `--engine native` forces the
-  native path. The ONNX path is still CUDA-only; no ORT CPU fallback was added.
+  when it can serve the request: `--model mini-0.8`, an explicit `--native-model`,
+  `--native-family kitten_tts2`, or a default request on macOS, where the
+  CUDA-only ONNX path cannot run. Explicit ONNX presets (`nano-0.8-fp32`) and
+  ONNX-only flags (`--repo-id`, `--style-index`, `--vram-profile`, `--trim-tail`,
+  `--phonemizer`, ORT/CUDA options) keep ONNX Runtime. `--engine native` forces
+  the native path. No ORT CPU fallback was added.
 - **Hardware acceleration by default.** `--native-backend auto` (the default)
   selects Metal on macOS arm64 and CUDA for `kitten_tts2` elsewhere, then CPU. If
   an accelerated run returns silent or non-finite audio, it is retried on CPU
@@ -45,6 +47,11 @@ Concretely:
 - **Explicit model prefetch.** `kitten-tts native fetch` downloads the Mini 0.8
   GGUF without synthesizing, and `models list` points at it. KittenTTS 2 weights
   remain a manual download.
+- **Verified downloads.** Files are written to a temporary path and renamed into
+  the cache only after the received byte count matches `Content-Length` and is
+  non-empty. Native models must start with the GGUF magic, checked after download
+  and on every cache hit, so a truncated or substituted file is rejected with
+  `native fetch --force` guidance instead of reaching the engine.
 - **One-pass environment check.** `kitten-tts native doctor` verifies the
   library (load, ABI, requested family), the eSpeak library and data paths, and
   the model (cached or `--native-model`) in a single run, reporting every
@@ -210,8 +217,9 @@ engine/flag combinations. Native CUDA could not be tested on this host.
 
 **P3 — Prefer the native engine (implemented).**
 `--engine auto` is the default and prefers native when it can serve the request
-(`--model mini-0.8`, explicit `--native-model`, or the v2 family), otherwise ONNX
-Runtime; a native preparation failure prints a one-line notice before falling
+(`--model mini-0.8`, explicit `--native-model`, the v2 family, or a default
+request on macOS); explicit ONNX presets and ONNX-only flags otherwise use ONNX
+Runtime. A native preparation failure prints a one-line notice before falling
 back. Exit: met — selection rules are documented and unit-tested.
 
 **P4 — Optional v2 family (implemented and validated on CPU).**
@@ -300,7 +308,7 @@ cloning and remaining language presets, listening quality.
 
 | Current flag | Native 0.8 behaviour |
 |---|---|
-| `--engine auto\|onnx\|native` | New; `auto` prefers native only when it can serve the request |
+| `--engine auto\|onnx\|native` | New; `auto` prefers native when it can serve the request, including the macOS default |
 | `--model` presets | Only `mini-0.8` has a packaged GGUF; other presets error unless `--native-model` overrides |
 | `--repo-id` | ONNX-only; error when combined with the native engine |
 | `--voice` | Supported via `voice_id`; invalid names list the available 0.8 voices |

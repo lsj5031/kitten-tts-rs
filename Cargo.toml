@@ -3,7 +3,7 @@ name = "kitten-tts"
 version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
-description = "Rust CLI for KittenTTS ONNX models"
+description = "Rust CLI for KittenTTS models with ONNX Runtime and audio.cpp engines"
 
 [dependencies]
 anyhow = "1.0"

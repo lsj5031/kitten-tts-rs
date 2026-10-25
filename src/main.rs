@@ -62,7 +62,7 @@ static ORT_INIT: OnceCell<()> = OnceCell::new();
 
 #[derive(Debug, Parser)]
 #[command(name = "kitten-tts")]
-#[command(about = "Rust CLI for KittenTTS ONNX models")]
+#[command(about = "Rust CLI for KittenTTS models (ONNX Runtime and audio.cpp)")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -1668,11 +1668,13 @@ fn download_repo_file(client: &Client, repo_id: &str, file_name: &str, dest: &Pa
             .error_for_status()
             .with_context(|| format!("download failed for {url}"))?;
 
+        let expected_len = response.content_length();
         let mut file = File::create(&temp_path)
             .with_context(|| format!("failed creating temp file {}", temp_path.display()))?;
-        io::copy(&mut response, &mut file)
+        let written = io::copy(&mut response, &mut file)
             .with_context(|| format!("failed writing to temp file {}", temp_path.display()))?;
         file.flush()?;
+        verify_download_size(expected_len, written, &url)?;
 
         fs::rename(&temp_path, dest).with_context(|| {
             format!(
@@ -1689,6 +1691,33 @@ fn download_repo_file(client: &Client, repo_id: &str, file_name: &str, dest: &Pa
         let _ = fs::remove_file(&temp_path);
     }
     result
+}
+
+fn verify_download_size(expected: Option<u64>, written: u64, url: &str) -> Result<()> {
+    if written == 0 {
+        bail!("download from {url} returned no data");
+    }
+    if let Some(expected) = expected
+        && expected != written
+    {
+        bail!("download from {url} was truncated: expected {expected} bytes, received {written}");
+    }
+    Ok(())
+}
+
+fn validate_native_gguf(path: &Path) -> Result<()> {
+    let mut file = File::open(path)
+        .with_context(|| format!("failed opening native model {}", path.display()))?;
+    let mut magic = [0_u8; 4];
+    file.read_exact(&mut magic)
+        .with_context(|| format!("failed reading native model header from {}", path.display()))?;
+    if &magic != b"GGUF" {
+        bail!(
+            "native model '{}' is not a GGUF file (unexpected header)",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn read_text_input(text_input: &TextInput) -> Result<String> {
@@ -2028,9 +2057,31 @@ fn auto_native_intent(args: &SynthesisArgs) -> AutoNativeIntent {
         AutoNativeIntent::Required
     } else if args.model.model == Some(ModelPreset::Mini08) {
         AutoNativeIntent::Opportunistic
+    } else if native_serves_default_request(args) {
+        // macOS cannot run the ONNX path, which requires CUDA. A plain request
+        // therefore uses the native Mini 0.8 package and falls back to ONNX only
+        // when the native library is missing.
+        AutoNativeIntent::Opportunistic
     } else {
         AutoNativeIntent::None
     }
+}
+
+fn native_serves_default_request(args: &SynthesisArgs) -> bool {
+    cfg!(target_os = "macos") && args.model.model.is_none() && !onnx_only_selection(args)
+}
+
+fn onnx_only_selection(args: &SynthesisArgs) -> bool {
+    args.model.repo_id.is_some()
+        || args.model.ort_lib.is_some()
+        || args.model.cuda_lib_dir.is_some()
+        || args.model.cudnn_lib_dir.is_some()
+        || args.model.cuda_device_id.is_some()
+        || args.model.cuda_memory_limit.is_some()
+        || args.model.vram_profile.is_some()
+        || args.style_index.is_some()
+        || args.trim_tail != DEFAULT_TRIM_TAIL
+        || args.phonemizer != PhonemizerMode::EspeakNg
 }
 
 fn prepare_onnx_backend(args: &SynthesisArgs) -> Result<SynthesisBackend> {
@@ -2069,9 +2120,11 @@ fn prepare_native_backend(args: &SynthesisArgs) -> Result<SynthesisBackend> {
     }
 
     let library_path = resolve_native_lib_path(args.native_lib.as_deref());
-    let cache_root = args.model.resolve_cache_dir()?;
-    let client = build_http_client()?;
-    let model_path = ensure_native_model_cached(&client, &cache_root, args)?;
+    // Check the local prerequisites before any network access. A missing or
+    // ABI-incompatible library makes this path unusable, and `auto` turns that
+    // into an ONNX fallback, so downloading the 288 MiB GGUF first would stall
+    // and waste bandwidth on an engine that cannot run.
+    drop(open_native_library(&library_path)?);
     let (espeak_lib, espeak_data) = if args.native_family == NativeFamily::KittenTts {
         (
             resolve_espeak_path(
@@ -2093,6 +2146,9 @@ fn prepare_native_backend(args: &SynthesisArgs) -> Result<SynthesisBackend> {
         }
         (None, None)
     };
+    let cache_root = args.model.resolve_cache_dir()?;
+    let client = build_http_client()?;
+    let model_path = ensure_native_model_cached(&client, &cache_root, args)?;
     let load_started = Instant::now();
     let synthesizer = NativeSynth::open(NativeOpenConfig {
         library_path: &library_path,
@@ -2144,6 +2200,14 @@ fn validate_native_args(args: &SynthesisArgs) -> Result<()> {
         if args.native_model.is_none() {
             bail!(
                 "KittenTTS 2 weights are not downloaded automatically; pass --native-model PATH to a local GGUF"
+            );
+        }
+        if let Some(seed) = args.seed
+            && seed > i64::MAX as u64
+        {
+            bail!(
+                "the kitten_tts2 port reads --seed as a signed 64-bit integer; use a value up to {}",
+                i64::MAX
             );
         }
     }
@@ -2203,6 +2267,7 @@ fn ensure_native_model_cached(
                 path.display()
             );
         }
+        validate_native_gguf(path)?;
         return Ok(path.clone());
     }
 
@@ -2223,6 +2288,12 @@ fn ensure_native_kitten_tts_model(
         eprintln!("[Native] downloading {NATIVE_MODEL_REPO}/{remote} (about 288 MiB)");
         download_repo_file(client, NATIVE_MODEL_REPO, &remote, &destination)
             .with_context(|| format!("failed downloading native model {remote}"))?;
+    }
+    if let Err(err) = validate_native_gguf(&destination) {
+        bail!(
+            "cached native model at {} is unusable: {err:#}; run `kitten-tts native fetch --force` to download it again",
+            destination.display()
+        );
     }
     Ok(destination)
 }
@@ -2519,6 +2590,7 @@ fn check_native_doctor_model(
                 path.display()
             );
         }
+        validate_native_gguf(path)?;
         return Ok(path.to_path_buf());
     }
 
@@ -2530,6 +2602,12 @@ fn check_native_doctor_model(
             let path = cache_root.join("native").join(NATIVE_KITTEN_TTS_FILE);
             if !path.is_file() {
                 bail!("cached model is missing at {}", path.display());
+            }
+            if let Err(err) = validate_native_gguf(&path) {
+                bail!(
+                    "cached model at {} is unusable: {err:#}; run `kitten-tts native fetch --force`",
+                    path.display()
+                );
             }
             Ok(path)
         }
@@ -3689,15 +3767,38 @@ mod tests {
     }
 
     #[test]
-    fn auto_engine_is_opportunistic_only_for_mini() {
-        assert_eq!(
-            auto_native_intent(&parse_synthesis_args(&[])),
+    fn auto_engine_uses_native_for_default_request_on_macos() {
+        let expected = if cfg!(target_os = "macos") {
+            AutoNativeIntent::Opportunistic
+        } else {
             AutoNativeIntent::None
-        );
+        };
+        assert_eq!(auto_native_intent(&parse_synthesis_args(&[])), expected);
+    }
+
+    #[test]
+    fn auto_engine_is_opportunistic_for_mini() {
         assert_eq!(
             auto_native_intent(&parse_synthesis_args(&["--model", "mini-0.8"])),
             AutoNativeIntent::Opportunistic
         );
+    }
+
+    #[test]
+    fn auto_engine_keeps_onnx_for_onnx_only_selection() {
+        for extra in [
+            vec!["--model", "nano-0.8-fp32"],
+            vec!["--style-index", "3"],
+            vec!["--phonemizer", "auto"],
+            vec!["--trim-tail", "6000"],
+            vec!["--repo-id", "someone/custom"],
+        ] {
+            assert_eq!(
+                auto_native_intent(&parse_synthesis_args(&extra)),
+                AutoNativeIntent::None,
+                "{extra:?}"
+            );
+        }
     }
 
     #[test]
@@ -3765,6 +3866,37 @@ mod tests {
     }
 
     #[test]
+    fn native_kitten_tts2_rejects_seed_above_signed_range() {
+        let args = parse_synthesis_args(&[
+            "--engine",
+            "native",
+            "--native-family",
+            "kitten_tts2",
+            "--native-model",
+            "/tmp/kitten-tts2.gguf",
+            "--accept-kitten2-license",
+            "--seed",
+            "9223372036854775808",
+        ]);
+        let err = validate_native_args(&args).unwrap_err().to_string();
+        assert!(err.contains("signed 64-bit"), "{err}");
+        assert!(err.contains("9223372036854775807"), "{err}");
+    }
+
+    #[test]
+    fn native_kitten_tts_accepts_full_u64_seed_range() {
+        let args = parse_synthesis_args(&[
+            "--engine",
+            "native",
+            "--model",
+            "mini-0.8",
+            "--seed",
+            "18446744073709551615",
+        ]);
+        assert!(validate_native_args(&args).is_ok());
+    }
+
+    #[test]
     fn synthesis_guardrails_apply_to_shared_chunking() {
         let err = prepare_synthesis_chunks("hello", 9.0, 400)
             .unwrap_err()
@@ -3813,12 +3945,63 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let existing = dir.path().join("native").join(NATIVE_KITTEN_TTS_FILE);
         fs::create_dir_all(existing.parent().expect("parent"))?;
-        fs::write(&existing, b"cached")?;
+        fs::write(&existing, b"GGUFcached")?;
 
         let client = build_http_client()?;
         let path = ensure_native_kitten_tts_model(&client, dir.path(), false)?;
         assert_eq!(path, existing);
-        assert_eq!(fs::read(&path)?, b"cached");
+        assert_eq!(fs::read(&path)?, b"GGUFcached");
+        Ok(())
+    }
+
+    #[test]
+    fn native_fetch_rejects_corrupt_cached_model() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let existing = dir.path().join("native").join(NATIVE_KITTEN_TTS_FILE);
+        fs::create_dir_all(existing.parent().expect("parent"))?;
+        fs::write(&existing, b"<html>not a model</html>")?;
+
+        let client = build_http_client()?;
+        let err = ensure_native_kitten_tts_model(&client, dir.path(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unusable"), "{err}");
+        assert!(err.contains("--force"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn download_size_check_rejects_empty_and_truncated() {
+        assert!(verify_download_size(Some(10), 10, "url").is_ok());
+        assert!(verify_download_size(None, 10, "url").is_ok());
+
+        let err = verify_download_size(Some(10), 4, "url")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("truncated"), "{err}");
+        assert!(err.contains("expected 10 bytes, received 4"), "{err}");
+
+        let err = verify_download_size(Some(0), 0, "url")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no data"), "{err}");
+    }
+
+    #[test]
+    fn gguf_validation_checks_magic() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let good = dir.path().join("good.gguf");
+        fs::write(&good, b"GGUFpayload")?;
+        validate_native_gguf(&good)?;
+
+        let bad = dir.path().join("bad.gguf");
+        fs::write(&bad, b"<html>")?;
+        let err = validate_native_gguf(&bad).unwrap_err().to_string();
+        assert!(err.contains("not a GGUF"), "{err}");
+
+        let empty = dir.path().join("empty.gguf");
+        fs::write(&empty, b"")?;
+        assert!(validate_native_gguf(&empty).is_err());
         Ok(())
     }
 
@@ -3870,10 +4053,38 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let existing = dir.path().join("native").join(NATIVE_KITTEN_TTS_FILE);
         fs::create_dir_all(existing.parent().expect("parent"))?;
-        fs::write(&existing, b"cached")?;
+        fs::write(&existing, b"GGUFcached")?;
 
         let path = check_native_doctor_model(NativeFamily::KittenTts, None, dir.path())?;
         assert_eq!(path, existing);
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_rejects_corrupt_cached_model() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let existing = dir.path().join("native").join(NATIVE_KITTEN_TTS_FILE);
+        fs::create_dir_all(existing.parent().expect("parent"))?;
+        fs::write(&existing, b"<html>nope</html>")?;
+
+        let err = check_native_doctor_model(NativeFamily::KittenTts, None, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unusable"), "{err}");
+        assert!(err.contains("--force"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_rejects_non_gguf_explicit_model() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let weights = dir.path().join("weights.gguf");
+        fs::write(&weights, b"not a model")?;
+
+        let err = check_native_doctor_model(NativeFamily::KittenTts2, Some(&weights), dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a GGUF"), "{err}");
         Ok(())
     }
 

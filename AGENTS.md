@@ -162,6 +162,7 @@ Examples:
 ## 6) Runtime/Product Defaults to Preserve
 
 - Default model: `KittenML/kitten-tts-nano-0.8-fp32`.
+  - On macOS, a default request (no `--model` and no ONNX-only flags) is served by the native engine with Mini 0.8, because the ONNX path is CUDA-only and cannot run there. Explicit ONNX presets and ONNX-only flags still select ORT; model defaults on other platforms are unchanged.
 - Default voice/style behavior:
   - when `--voice` is omitted, choose a random canonical voice
   - when `--style-index` is omitted, choose a random style row
@@ -172,11 +173,12 @@ Examples:
   - `--allow-clipping` is available for manual/unsafe gain control
 - ONNX path runtime: CUDA execution provider is required; do not add ORT CPU fallback paths.
 - Optional native engine (`--engine auto|onnx|native`):
-  - `auto` prefers audio.cpp only when it can serve the request (mini preset, explicit `--native-model`, or v2 family); default ONNX preset stays on ORT.
+  - `auto` prefers audio.cpp when it can serve the request: mini preset, explicit `--native-model`, v2 family, or the macOS default request. Explicit ONNX presets and ONNX-only flags stay on ORT.
   - `auto` backend tries accelerators then `cpu`: `metal` on macOS arm64, `cuda`/`vulkan`/`hip` on Linux/Windows. Retry once on `cpu` when accelerated output is silent or non-finite.
   - Reject silent or non-finite native output instead of writing WAVs.
   - Never bundle GGUF weights or `libespeak-ng`; fetch weights with `native fetch` or on first use, and point at the user's library.
-  - `native doctor` checks library, eSpeak and model in one pass, reports every failure without downloading, and exits non-zero when a check fails.
+  - Verify downloads before caching them: reject empty or truncated transfers, require the GGUF magic for native models on download and reuse, and point corrupt caches at `native fetch --force`.
+  - `native doctor` checks library, eSpeak and model (including its GGUF header) in one pass, reports every failure without downloading, and exits non-zero when a check fails.
   - KittenTTS 2 requires a local GGUF plus `--accept-kitten2-license`.
 - ONNX Runtime loading policy:
   - use dynamic loading (`load-dynamic`) with user/system-provided `libonnxruntime`
