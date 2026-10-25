@@ -2079,6 +2079,11 @@ fn onnx_only_selection(args: &SynthesisArgs) -> bool {
         || args.model.cuda_device_id.is_some()
         || args.model.cuda_memory_limit.is_some()
         || args.model.vram_profile.is_some()
+        || args.model.arena_strategy != ArenaStrategy::SameAsRequested
+        || args.model.conv_algo != ConvAlgo::Heuristic
+        || args.model.graph_opt != GraphOpt::Level1
+        || args.model.memory_pattern
+        || args.model.parallel_execution
         || args.style_index.is_some()
         || args.trim_tail != DEFAULT_TRIM_TAIL
         || args.phonemizer != PhonemizerMode::EspeakNg
@@ -2131,11 +2136,13 @@ fn prepare_native_backend(args: &SynthesisArgs) -> Result<SynthesisBackend> {
                 args.native_espeak_lib.as_deref(),
                 detect_espeak_library,
                 "libespeak-ng",
+                false,
             )?,
             resolve_espeak_path(
                 args.native_espeak_data.as_deref(),
                 detect_espeak_data,
                 "espeak-ng-data",
+                true,
             )?,
         )
     } else {
@@ -2218,10 +2225,17 @@ fn resolve_espeak_path(
     explicit: Option<&Path>,
     detect: fn() -> Option<PathBuf>,
     label: &str,
+    directory: bool,
 ) -> Result<Option<PathBuf>> {
     if let Some(path) = explicit {
         if !path.exists() {
             bail!("{label} path '{}' does not exist", path.display());
+        }
+        if directory && !path.is_dir() {
+            bail!("{label} path '{}' must be a directory", path.display());
+        }
+        if !directory && !path.is_file() {
+            bail!("{label} path '{}' must be a file", path.display());
         }
         return Ok(Some(path.to_path_buf()));
     }
@@ -2645,6 +2659,7 @@ fn doctor_native_runtime(args: &NativeDoctorArgs) -> Result<()> {
             args.native_espeak_lib.as_deref(),
             detect_espeak_library,
             "libespeak-ng",
+            false,
         ) {
             Ok(Some(path)) => report.ok("espeak lib", path.display().to_string()),
             Ok(None) => report.failed(
@@ -2657,6 +2672,7 @@ fn doctor_native_runtime(args: &NativeDoctorArgs) -> Result<()> {
             args.native_espeak_data.as_deref(),
             detect_espeak_data,
             "espeak-ng-data",
+            true,
         ) {
             Ok(Some(path)) => report.ok("espeak data", path.display().to_string()),
             Ok(None) => report.failed(
@@ -3792,6 +3808,11 @@ mod tests {
             vec!["--phonemizer", "auto"],
             vec!["--trim-tail", "6000"],
             vec!["--repo-id", "someone/custom"],
+            vec!["--arena-strategy", "next-power-of-two"],
+            vec!["--conv-algo", "exhaustive"],
+            vec!["--graph-opt", "3"],
+            vec!["--memory-pattern"],
+            vec!["--parallel-execution"],
         ] {
             assert_eq!(
                 auto_native_intent(&parse_synthesis_args(&extra)),
@@ -4032,10 +4053,40 @@ mod tests {
             Some(Path::new("/nonexistent/libespeak-ng.dylib")),
             detect_espeak_library,
             "libespeak-ng",
+            false,
         )
         .unwrap_err()
         .to_string();
         assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn explicit_native_espeak_paths_require_correct_types() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("libespeak-ng");
+        fs::write(&file, b"fixture")?;
+        assert!(
+            resolve_espeak_path(Some(&file), detect_espeak_library, "libespeak-ng", false)?
+                .is_some()
+        );
+        assert!(
+            resolve_espeak_path(Some(dir.path()), detect_espeak_data, "espeak-ng-data", true)?
+                .is_some()
+        );
+        let err = resolve_espeak_path(
+            Some(dir.path()),
+            detect_espeak_library,
+            "libespeak-ng",
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must be a file"), "{err}");
+        let err = resolve_espeak_path(Some(&file), detect_espeak_data, "espeak-ng-data", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be a directory"), "{err}");
+        Ok(())
     }
 
     #[test]
