@@ -2,38 +2,21 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use libloading::Library;
-use ndarray::{Array1, Array2};
-use once_cell::sync::{Lazy, OnceCell};
-use ort::{
-    ep, inputs,
-    session::{Session, builder::GraphOptimizationLevel},
-    value::Tensor,
-};
+use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::raw::{c_char, c_int, c_void};
-use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use zip::ZipArchive;
 
-const DEFAULT_REPO_ID: &str = "KittenML/kitten-tts-nano-0.8-fp32";
 const DEFAULT_SAMPLE_RATE: u32 = 24_000;
 const DEFAULT_MAX_CHARS: usize = 400;
-const DEFAULT_TRIM_TAIL: usize = 5_000;
 const DEFAULT_PLAY_GAIN: f32 = 2.5;
-const DEFAULT_CUDA_MEMORY_LIMIT_BYTES: usize = 2 * 1024 * 1024 * 1024;
-const DEFAULT_CUDA_DEVICE_ID: i32 = 0;
-const SAFE_INTRA_THREADS: usize = 1;
-const SAFE_INTER_THREADS: usize = 1;
-const MAX_INPUT_TOKENS: usize = 510;
 const MAX_TOTAL_INPUT_CHARS: usize = 20_000;
 const MAX_SYNTHESIS_CHUNKS: usize = 256;
 const MAX_CHARS_HARD_LIMIT: usize = 2_000;
@@ -41,10 +24,7 @@ const MIN_SPEED: f32 = 0.5;
 const MAX_SPEED: f32 = 2.0;
 const MIN_OUTPUT_GAIN: f32 = 0.1;
 const MAX_OUTPUT_GAIN: f32 = 8.0;
-const VRAM_HEADROOM_MIB: u64 = 512;
 const SAFE_PLAYBACK_PEAK: f32 = 0.98;
-const TOKEN_PAD_ID: i64 = 0;
-const MAX_NPY_ENTRY_BYTES: u64 = 50 * 1024 * 1024;
 const AUDIOCPP_ABI_MAJOR: u32 = 0;
 const AUDIOCPP_LIB_ENV: &str = "AUDIOCPP_LIB";
 const AUDIOCPP_OK: c_int = 0;
@@ -58,11 +38,10 @@ const NATIVE_KITTEN_TTS_VOICES: [&str; 8] = [
 ];
 
 static SPACES_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").expect("valid regex"));
-static ORT_INIT: OnceCell<()> = OnceCell::new();
 
 #[derive(Debug, Parser)]
 #[command(name = "kitten-tts")]
-#[command(about = "Rust CLI for KittenTTS models (ONNX Runtime and audio.cpp)")]
+#[command(about = "Native KittenTTS text-to-speech with audio.cpp")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -74,7 +53,6 @@ enum Commands {
     Stream(StreamArgs),
     Play(PlayArgs),
     Voices(VoicesArgs),
-    Model(ModelCommandTop),
     Models(ModelsCommandTop),
     Native(NativeCommandTop),
 }
@@ -96,19 +74,16 @@ struct SynthesisArgs {
     sample_rate: u32,
     #[arg(long, default_value_t = DEFAULT_MAX_CHARS)]
     max_chars: usize,
-    #[arg(long, default_value_t = DEFAULT_TRIM_TAIL)]
-    trim_tail: usize,
-    #[arg(long)]
-    style_index: Option<usize>,
-    #[arg(long, help = "Random seed for reproducible voice/style selection")]
+    #[arg(
+        long,
+        help = "Random seed for reproducible voice selection and decoder noise"
+    )]
     seed: Option<u64>,
-    #[arg(long, value_enum, default_value_t = PhonemizerMode::EspeakNg)]
-    phonemizer: PhonemizerMode,
     #[arg(
         long,
         value_enum,
-        default_value_t = EngineChoice::Auto,
-        help = "Synthesis engine: auto (native when supported, else ONNX), onnx, or native"
+        default_value_t = EngineChoice::Native,
+        help = "Native engine (auto is a compatibility alias for native)"
     )]
     engine: EngineChoice,
     #[arg(
@@ -200,34 +175,8 @@ struct PlayArgs {
 
 #[derive(Debug, Args)]
 struct VoicesArgs {
-    #[command(flatten)]
-    model: ModelSelection,
-}
-
-#[derive(Debug, Args)]
-struct ModelCommandTop {
-    #[command(subcommand)]
-    command: ModelCommands,
-}
-
-#[derive(Debug, Subcommand)]
-enum ModelCommands {
-    Fetch(ModelFetchArgs),
-    Info(ModelInfoArgs),
-}
-
-#[derive(Debug, Args)]
-struct ModelFetchArgs {
-    #[command(flatten)]
-    model: ModelSelection,
-    #[arg(long)]
-    force: bool,
-}
-
-#[derive(Debug, Args)]
-struct ModelInfoArgs {
-    #[command(flatten)]
-    model: ModelSelection,
+    #[arg(long, value_enum, default_value_t = NativeFamily::KittenTts)]
+    native_family: NativeFamily,
 }
 
 #[derive(Debug, Args)]
@@ -244,7 +193,7 @@ enum ModelsCommands {
 #[derive(Debug, Args)]
 #[command(
     about = "Native audio.cpp engine: probe the library and download models",
-    long_about = "Native audio.cpp engine control. `doctor` checks everything `--engine native` needs in one pass: the library and its ABI/families, the eSpeak runtime, and the model (cached or explicit). `probe` reports library details only; `fetch` downloads the Mini 0.8 GGUF so `--engine native` can run offline. None of these commands need ONNX Runtime."
+    long_about = "Native audio.cpp engine control. `doctor` checks everything `--engine native` needs in one pass: the library and its ABI/families, the eSpeak runtime, and the model (cached or explicit). `probe` reports library details only; `fetch` downloads the Mini 0.8 GGUF so `--engine native` can run offline. All synthesis uses this engine."
 )]
 struct NativeCommandTop {
     #[command(subcommand)]
@@ -257,7 +206,7 @@ enum NativeCommands {
     Probe(NativeProbeArgs),
     /// Download the native model into the cache
     #[command(
-        long_about = "Download the KittenTTS Mini 0.8 GGUF used by `--engine native --model mini-0.8` into the cache directory. Re-running is cheap: an existing file is reused unless --force is passed. KittenTTS 2 weights are licensed differently and are never downloaded by this command."
+        long_about = "Download the KittenTTS Mini 0.8 GGUF used by `--model mini-0.8` into the cache directory. Re-running is cheap: an existing file is reused unless --force is passed. KittenTTS 2 weights are licensed differently and are never downloaded by this command."
     )]
     Fetch(NativeFetchArgs),
     /// Check the library, eSpeak and cached model in one pass
@@ -340,161 +289,10 @@ struct NativeDoctorArgs {
 
 #[derive(Debug, Clone, Args)]
 struct ModelSelection {
-    #[arg(long, value_enum)]
-    model: Option<ModelPreset>,
-    #[arg(long)]
-    repo_id: Option<String>,
+    #[arg(long, value_enum, default_value_t = ModelPreset::Mini08)]
+    model: ModelPreset,
     #[arg(long)]
     cache_dir: Option<PathBuf>,
-    #[arg(
-        long,
-        help = "Path to libonnxruntime shared library for dynamic loading"
-    )]
-    ort_lib: Option<PathBuf>,
-    #[arg(long, help = "Directory containing CUDA runtime shared libraries")]
-    cuda_lib_dir: Option<PathBuf>,
-    #[arg(long, help = "Directory containing cuDNN shared libraries")]
-    cudnn_lib_dir: Option<PathBuf>,
-    #[arg(long, help = "CUDA device index (default: 0)")]
-    cuda_device_id: Option<i32>,
-    #[arg(
-        long,
-        help = "CUDA memory arena limit in MiB (default: 2048). Lower this on GPUs with limited VRAM to avoid driver crashes"
-    )]
-    cuda_memory_limit: Option<usize>,
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = ArenaStrategy::SameAsRequested,
-        help = "Memory arena extend strategy: same-as-requested (minimize allocation) or next-power-of-two (better performance)"
-    )]
-    arena_strategy: ArenaStrategy,
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = ConvAlgo::Heuristic,
-        help = "cuDNN convolution algorithm search: heuristic (low memory) or exhaustive (better performance)"
-    )]
-    conv_algo: ConvAlgo,
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = GraphOpt::Level1,
-        help = "ONNX graph optimization level: basic (1) or full (3). Higher levels may use more VRAM but optimize better"
-    )]
-    graph_opt: GraphOpt,
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Enable memory pattern planning (pre-allocate buffers) for faster execution"
-    )]
-    memory_pattern: bool,
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Enable parallel execution (concurrent kernels) for potential speedup"
-    )]
-    parallel_execution: bool,
-    #[arg(
-        long,
-        value_enum,
-        help = "VRAM profile: minimal (lowest VRAM), balanced (default), performance (fastest)"
-    )]
-    vram_profile: Option<VramProfile>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum GraphOpt {
-    #[value(name = "1")]
-    Level1,
-    #[value(name = "3")]
-    Level3,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum VramProfile {
-    #[value(name = "minimal")]
-    Minimal,
-    #[value(name = "balanced")]
-    Balanced,
-    #[value(name = "performance")]
-    Performance,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum ArenaStrategy {
-    #[value(name = "same-as-requested")]
-    SameAsRequested,
-    #[value(name = "next-power-of-two")]
-    NextPowerOfTwo,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum ConvAlgo {
-    #[value(name = "heuristic")]
-    Heuristic,
-    #[value(name = "default")]
-    Default,
-    #[value(name = "exhaustive")]
-    Exhaustive,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ResolvedSessionConfig {
-    arena_strategy: ArenaStrategy,
-    conv_algo: ConvAlgo,
-    graph_opt: GraphOpt,
-    memory_pattern: bool,
-    parallel_execution: bool,
-    inter_threads: usize,
-}
-
-fn resolve_session_config(cfg: &OrtRuntimeConfig) -> ResolvedSessionConfig {
-    match cfg.vram_profile {
-        Some(VramProfile::Minimal) => ResolvedSessionConfig {
-            arena_strategy: ArenaStrategy::SameAsRequested,
-            conv_algo: ConvAlgo::Heuristic,
-            graph_opt: GraphOpt::Level1,
-            memory_pattern: false,
-            parallel_execution: false,
-            inter_threads: SAFE_INTER_THREADS,
-        },
-        Some(VramProfile::Performance) => ResolvedSessionConfig {
-            arena_strategy: ArenaStrategy::NextPowerOfTwo,
-            conv_algo: ConvAlgo::Exhaustive,
-            graph_opt: GraphOpt::Level3,
-            memory_pattern: true,
-            parallel_execution: true,
-            inter_threads: 0, // let ORT decide
-        },
-        Some(VramProfile::Balanced) | None => ResolvedSessionConfig {
-            arena_strategy: cfg.arena_strategy,
-            conv_algo: cfg.conv_algo,
-            graph_opt: cfg.graph_opt,
-            memory_pattern: cfg.memory_pattern,
-            parallel_execution: cfg.parallel_execution,
-            inter_threads: if cfg.parallel_execution {
-                0
-            } else {
-                SAFE_INTER_THREADS
-            },
-        },
-    }
-}
-
-#[derive(Debug, Clone)]
-struct OrtRuntimeConfig {
-    ort_lib: Option<PathBuf>,
-    cuda_lib_dir: Option<PathBuf>,
-    cudnn_lib_dir: Option<PathBuf>,
-    cuda_device_id: i32,
-    cuda_memory_limit_bytes: usize,
-    arena_strategy: ArenaStrategy,
-    conv_algo: ConvAlgo,
-    graph_opt: GraphOpt,
-    memory_pattern: bool,
-    parallel_execution: bool,
-    vram_profile: Option<VramProfile>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -511,13 +309,6 @@ enum WavEncoding {
     Float32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum PhonemizerMode {
-    Auto,
-    EspeakNg,
-    Espeak,
-}
-
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum PlayerMode {
     Auto,
@@ -528,7 +319,6 @@ enum PlayerMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum EngineChoice {
     Auto,
-    Onnx,
     Native,
 }
 
@@ -592,304 +382,13 @@ impl NativeFamily {
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum ModelPreset {
-    #[value(name = "nano-0.8-int8")]
-    Nano08Int8,
-    #[value(name = "nano-0.8-fp32")]
-    Nano08Fp32,
-    #[value(name = "micro-0.8")]
-    Micro08,
     #[value(name = "mini-0.8")]
     Mini08,
 }
 
-impl ModelPreset {
-    fn repo_id(self) -> &'static str {
-        match self {
-            Self::Nano08Int8 => "KittenML/kitten-tts-nano-0.8-int8",
-            Self::Nano08Fp32 => "KittenML/kitten-tts-nano-0.8-fp32",
-            Self::Micro08 => "KittenML/kitten-tts-micro-0.8",
-            Self::Mini08 => "KittenML/kitten-tts-mini-0.8",
-        }
-    }
-
-    fn all() -> [Self; 4] {
-        [
-            Self::Nano08Int8,
-            Self::Nano08Fp32,
-            Self::Micro08,
-            Self::Mini08,
-        ]
-    }
-}
-
 impl ModelSelection {
-    fn resolve_repo_id(&self) -> String {
-        if let Some(repo_id) = &self.repo_id {
-            return repo_id.clone();
-        }
-        if let Some(preset) = self.model {
-            return preset.repo_id().to_string();
-        }
-        DEFAULT_REPO_ID.to_string()
-    }
-
     fn resolve_cache_dir(&self) -> Result<PathBuf> {
         resolve_cache_root(self.cache_dir.as_deref())
-    }
-
-    fn resolve_ort_runtime_config(&self) -> OrtRuntimeConfig {
-        OrtRuntimeConfig {
-            ort_lib: self.ort_lib.clone(),
-            cuda_lib_dir: self.cuda_lib_dir.clone(),
-            cudnn_lib_dir: self.cudnn_lib_dir.clone(),
-            cuda_device_id: self.cuda_device_id.unwrap_or(DEFAULT_CUDA_DEVICE_ID),
-            cuda_memory_limit_bytes: self
-                .cuda_memory_limit
-                .map(|mib| mib * 1024 * 1024)
-                .unwrap_or(DEFAULT_CUDA_MEMORY_LIMIT_BYTES),
-            arena_strategy: self.arena_strategy,
-            conv_algo: self.conv_algo,
-            graph_opt: self.graph_opt,
-            memory_pattern: self.memory_pattern,
-            parallel_execution: self.parallel_execution,
-            vram_profile: self.vram_profile,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ModelConfig {
-    #[serde(rename = "type")]
-    model_type: String,
-    model_file: String,
-    voices: String,
-    #[serde(default)]
-    speed_priors: HashMap<String, f32>,
-    #[serde(default)]
-    voice_aliases: HashMap<String, String>,
-}
-
-#[derive(Debug, Serialize)]
-struct CacheManifest {
-    repo_id: String,
-    fetched_at_unix: u64,
-    model_file: String,
-    voices_file: String,
-}
-
-#[derive(Debug)]
-struct ModelArtifacts {
-    repo_id: String,
-    cache_dir: PathBuf,
-    config_path: PathBuf,
-    model_path: PathBuf,
-    voices_path: PathBuf,
-    config: ModelConfig,
-}
-
-#[derive(Debug)]
-struct VoiceStyle {
-    rows: usize,
-    cols: usize,
-    data: Vec<f32>,
-}
-
-impl VoiceStyle {
-    fn row(&self, index: usize) -> Result<&[f32]> {
-        if self.cols == 0 {
-            bail!("invalid voice style: zero columns");
-        }
-        if index >= self.rows {
-            bail!("style row index out of bounds: {index} >= {}", self.rows);
-        }
-        let start = index * self.cols;
-        let end = start + self.cols;
-        Ok(&self.data[start..end])
-    }
-}
-
-#[derive(Debug)]
-struct VoiceTable {
-    voices: BTreeMap<String, VoiceStyle>,
-}
-
-impl VoiceTable {
-    fn load(path: &Path) -> Result<Self> {
-        let file = File::open(path)
-            .with_context(|| format!("failed to open voices archive: {}", path.display()))?;
-        let mut archive = ZipArchive::new(file)
-            .with_context(|| format!("failed to read npz archive: {}", path.display()))?;
-
-        let mut voices = BTreeMap::new();
-        for i in 0..archive.len() {
-            let mut entry = archive.by_index(i)?;
-            let name = entry.name().to_string();
-            if !name.ends_with(".npy") {
-                continue;
-            }
-
-            let mut raw = Vec::new();
-            (&mut entry)
-                .take(MAX_NPY_ENTRY_BYTES + 1)
-                .read_to_end(&mut raw)?;
-            if raw.len() as u64 > MAX_NPY_ENTRY_BYTES {
-                bail!(
-                    "npy entry '{name}' exceeds maximum allowed size ({MAX_NPY_ENTRY_BYTES} bytes)"
-                );
-            }
-            let (rows, cols, data) =
-                parse_npy_f32(&raw).with_context(|| format!("failed parsing npy entry: {name}"))?;
-
-            let key = name.trim_end_matches(".npy").to_string();
-            voices.insert(key, VoiceStyle { rows, cols, data });
-        }
-
-        if voices.is_empty() {
-            bail!("voices archive did not contain any .npy entries");
-        }
-
-        Ok(Self { voices })
-    }
-
-    fn style_row(&self, voice: &str, index: usize) -> Result<&[f32]> {
-        let style = self
-            .voices
-            .get(voice)
-            .ok_or_else(|| anyhow!("voice '{voice}' not found in voices archive"))?;
-        style.row(index)
-    }
-
-    fn canonical_voices(&self) -> Vec<String> {
-        self.voices.keys().cloned().collect()
-    }
-
-    fn max_style_rows(&self, voice: &str) -> Result<usize> {
-        let style = self
-            .voices
-            .get(voice)
-            .ok_or_else(|| anyhow!("voice '{voice}' not found in voices archive"))?;
-        Ok(style.rows)
-    }
-}
-
-#[derive(Debug)]
-struct TextCleaner {
-    word_index_dictionary: HashMap<char, i64>,
-}
-
-impl TextCleaner {
-    fn new() -> Self {
-        let pad = "$";
-        let punctuation = ";:,.!?¡¿—…\"«»“” ";
-        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-        let letters_ipa = "ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘'̩'ᵻ";
-
-        let symbols: Vec<char> = pad
-            .chars()
-            .chain(punctuation.chars())
-            .chain(letters.chars())
-            .chain(letters_ipa.chars())
-            .collect();
-
-        let mut map = HashMap::with_capacity(symbols.len());
-        for (idx, ch) in symbols.into_iter().enumerate() {
-            map.insert(ch, idx as i64);
-        }
-
-        Self {
-            word_index_dictionary: map,
-        }
-    }
-
-    fn encode_into(&self, text: &str, out: &mut Vec<i64>) {
-        for ch in text.chars() {
-            if let Some(index) = self.word_index_dictionary.get(&ch) {
-                out.push(*index);
-            }
-        }
-    }
-}
-
-trait Phonemizer {
-    fn name(&self) -> &str;
-    fn phonemize(&self, text: &str) -> Result<String>;
-}
-
-#[derive(Debug)]
-struct EspeakPhonemizer {
-    program: String,
-}
-
-impl Phonemizer for EspeakPhonemizer {
-    fn name(&self) -> &str {
-        &self.program
-    }
-
-    fn phonemize(&self, text: &str) -> Result<String> {
-        let output = Command::new(&self.program)
-            .args(["-q", "--ipa=3", "-v", "en-us", text])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| {
-                format!(
-                    "failed to execute phonemizer program '{}': ensure it is installed",
-                    self.program
-                )
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("phonemizer '{}' failed: {}", self.program, stderr.trim());
-        }
-
-        let stdout = String::from_utf8(output.stdout)
-            .context("phonemizer emitted non-utf8 output")?
-            .trim()
-            .to_string();
-
-        if stdout.is_empty() {
-            bail!(
-                "phonemizer '{}' returned empty phoneme output",
-                self.program
-            );
-        }
-
-        Ok(stdout)
-    }
-}
-
-fn detect_phonemizer(mode: PhonemizerMode) -> Result<Box<dyn Phonemizer>> {
-    match mode {
-        PhonemizerMode::Auto => {
-            if executable_in_path("espeak-ng") {
-                return Ok(Box::new(EspeakPhonemizer {
-                    program: "espeak-ng".to_string(),
-                }));
-            }
-            if executable_in_path("espeak") {
-                return Ok(Box::new(EspeakPhonemizer {
-                    program: "espeak".to_string(),
-                }));
-            }
-            bail!("no espeak phonemizer found on PATH (tried: espeak-ng, espeak)")
-        }
-        PhonemizerMode::EspeakNg => {
-            if !executable_in_path("espeak-ng") {
-                bail!("phonemizer 'espeak-ng' not found on PATH");
-            }
-            Ok(Box::new(EspeakPhonemizer {
-                program: "espeak-ng".to_string(),
-            }))
-        }
-        PhonemizerMode::Espeak => {
-            if !executable_in_path("espeak") {
-                bail!("phonemizer 'espeak' not found on PATH");
-            }
-            Ok(Box::new(EspeakPhonemizer {
-                program: "espeak".to_string(),
-            }))
-        }
     }
 }
 
@@ -957,21 +456,10 @@ fn detect_player(mode: PlayerMode) -> Result<&'static str> {
     }
 }
 
-struct Synthesizer {
-    session: Session,
-    voice_table: VoiceTable,
-    text_cleaner: TextCleaner,
-    speed_priors: HashMap<String, f32>,
-    voice_aliases: HashMap<String, String>,
-    random_voice_state_path: PathBuf,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct SynthesisConfig {
     speed: f32,
     max_chars: usize,
-    trim_tail: usize,
-    style_index: Option<usize>,
     seed: Option<u64>,
 }
 
@@ -980,8 +468,6 @@ impl From<&SynthesisArgs> for SynthesisConfig {
         Self {
             speed: args.speed,
             max_chars: args.max_chars,
-            trim_tail: args.trim_tail,
-            style_index: args.style_index,
             seed: args.seed,
         }
     }
@@ -1021,259 +507,6 @@ impl SimpleRng {
     }
 }
 
-impl Synthesizer {
-    fn new(artifacts: &ModelArtifacts, ort_runtime: &OrtRuntimeConfig) -> Result<Self> {
-        init_ort(ort_runtime)?;
-
-        let arena_mib = (ort_runtime.cuda_memory_limit_bytes / (1024 * 1024)) as u64;
-        check_gpu_vram(ort_runtime.cuda_device_id, arena_mib)?;
-
-        let resolved = resolve_session_config(ort_runtime);
-
-        if let Some(profile) = ort_runtime.vram_profile {
-            eprintln!("[VRAM Profile] {:?}", profile);
-        }
-        eprintln!(
-            "[Session] arena={:?}, conv={:?}, graph_opt={:?}, mem_pattern={}, parallel={}, inter_threads={}",
-            resolved.arena_strategy,
-            resolved.conv_algo,
-            resolved.graph_opt,
-            resolved.memory_pattern,
-            resolved.parallel_execution,
-            resolved.inter_threads,
-        );
-
-        let arena_strategy = match resolved.arena_strategy {
-            ArenaStrategy::SameAsRequested => ort::ep::ArenaExtendStrategy::SameAsRequested,
-            ArenaStrategy::NextPowerOfTwo => ort::ep::ArenaExtendStrategy::NextPowerOfTwo,
-        };
-        let conv_algo = match resolved.conv_algo {
-            ConvAlgo::Heuristic => ep::cuda::ConvAlgorithmSearch::Heuristic,
-            ConvAlgo::Default => ep::cuda::ConvAlgorithmSearch::Default,
-            ConvAlgo::Exhaustive => ep::cuda::ConvAlgorithmSearch::Exhaustive,
-        };
-        let graph_opt_level = match resolved.graph_opt {
-            GraphOpt::Level1 => GraphOptimizationLevel::Level1,
-            GraphOpt::Level3 => GraphOptimizationLevel::All,
-        };
-
-        let cuda_ep = ep::CUDA::default()
-            .with_device_id(ort_runtime.cuda_device_id)
-            .with_memory_limit(ort_runtime.cuda_memory_limit_bytes)
-            .with_conv_algorithm_search(conv_algo)
-            .with_conv_max_workspace(false)
-            .with_arena_extend_strategy(arena_strategy)
-            .build()
-            .error_on_failure();
-
-        let session_builder = Session::builder()?
-            .with_no_environment_execution_providers()?
-            .with_parallel_execution(resolved.parallel_execution)?
-            .with_intra_threads(SAFE_INTRA_THREADS)?
-            .with_inter_threads(resolved.inter_threads)?
-            .with_intra_op_spinning(false)?
-            .with_inter_op_spinning(false)?
-            .with_memory_pattern(resolved.memory_pattern)?
-            .with_deterministic_compute(true)?;
-
-        let session = session_builder
-            .with_execution_providers([cuda_ep])
-            .context(
-                "failed enabling CUDA execution provider (GPU is required; ensure CUDA 12 + cuDNN runtime libraries are installed)",
-            )?
-            .with_optimization_level(graph_opt_level)?
-            .commit_from_file(&artifacts.model_path)
-            .with_context(|| {
-                format!(
-                    "failed to load onnx model from {}",
-                    artifacts.model_path.display()
-                )
-            })?;
-
-        let voice_table = VoiceTable::load(&artifacts.voices_path)?;
-
-        Ok(Self {
-            session,
-            voice_table,
-            text_cleaner: TextCleaner::new(),
-            speed_priors: artifacts.config.speed_priors.clone(),
-            voice_aliases: artifacts.config.voice_aliases.clone(),
-            random_voice_state_path: artifacts.cache_dir.join("last_random_voice.txt"),
-        })
-    }
-
-    fn synthesize(
-        &mut self,
-        text: &str,
-        voice: Option<&str>,
-        config: SynthesisConfig,
-        phonemizer: &dyn Phonemizer,
-    ) -> Result<Vec<f32>> {
-        let mut output = Vec::new();
-        self.synthesize_streaming(text, voice, config, phonemizer, |chunk| {
-            output.extend_from_slice(chunk);
-            Ok(())
-        })?;
-        Ok(output)
-    }
-
-    fn synthesize_streaming(
-        &mut self,
-        text: &str,
-        voice: Option<&str>,
-        config: SynthesisConfig,
-        phonemizer: &dyn Phonemizer,
-        mut on_chunk: impl FnMut(&[f32]) -> Result<()>,
-    ) -> Result<()> {
-        let chunks = prepare_synthesis_chunks(text, config.speed, config.max_chars)?;
-
-        let mut rng = SimpleRng::from_seed(config.seed.unwrap_or_else(runtime_entropy_seed));
-        let canonical_voice = self.resolve_voice(voice, &mut rng)?;
-        let max_rows = self.voice_table.max_style_rows(&canonical_voice)?;
-        let style_ref_id = resolve_style_index(max_rows, config.style_index, &mut rng);
-        if voice.is_none() {
-            eprintln!("using random voice: {canonical_voice}");
-        }
-        if config.style_index.is_none() {
-            eprintln!("using random style-index: {style_ref_id}");
-        }
-
-        for chunk in chunks {
-            let chunk_audio = self.synthesize_single_chunk(
-                &chunk,
-                &canonical_voice,
-                config.speed,
-                config.trim_tail,
-                style_ref_id,
-                phonemizer,
-            )?;
-            on_chunk(&chunk_audio)?;
-        }
-
-        Ok(())
-    }
-
-    fn resolve_voice(&self, voice: Option<&str>, rng: &mut SimpleRng) -> Result<String> {
-        if let Some(voice) = voice {
-            let resolved = self
-                .voice_aliases
-                .get(voice)
-                .cloned()
-                .unwrap_or_else(|| voice.to_string());
-
-            if self.voice_table.voices.contains_key(&resolved) {
-                return Ok(resolved);
-            }
-
-            bail!("voice '{voice}' is not available. Run `kitten-tts voices` to list voices");
-        }
-
-        let canonical = self.voice_table.canonical_voices();
-        if canonical.is_empty() {
-            bail!("no voices available in voice table");
-        }
-
-        let previous = load_last_random_voice(&self.random_voice_state_path);
-        let mut candidates = canonical;
-        if let Some(previous) = previous
-            && candidates.len() > 1
-        {
-            candidates.retain(|v| v != &previous);
-        }
-
-        let selected = candidates[rng.gen_index(candidates.len())].clone();
-        if let Err(err) = store_last_random_voice(&self.random_voice_state_path, &selected) {
-            eprintln!(
-                "warning: could not persist last random voice to {}: {err}",
-                self.random_voice_state_path.display()
-            );
-        }
-        Ok(selected)
-    }
-
-    fn synthesize_single_chunk(
-        &mut self,
-        chunk: &str,
-        voice: &str,
-        speed: f32,
-        trim_tail: usize,
-        style_ref_id: usize,
-        phonemizer: &dyn Phonemizer,
-    ) -> Result<Vec<f32>> {
-        let mut tokens = tokenize_phonemes(
-            &self.text_cleaner,
-            &phonemizer.phonemize(chunk).with_context(|| {
-                format!(
-                    "failed phonemizing chunk using backend '{}': {chunk}",
-                    phonemizer.name()
-                )
-            })?,
-        );
-
-        if tokens.is_empty() {
-            bail!("tokenizer produced empty token sequence for chunk '{chunk}'");
-        }
-        if tokens.len() > MAX_INPUT_TOKENS {
-            bail!(
-                "phonemized chunk produced {} tokens (max {MAX_INPUT_TOKENS}). \
-                 Reduce --max-chars to produce shorter chunks",
-                tokens.len()
-            );
-        }
-
-        tokens.insert(0, TOKEN_PAD_ID);
-        tokens.push(TOKEN_PAD_ID);
-
-        let style = self.voice_table.style_row(voice, style_ref_id)?.to_vec();
-        let adjusted_speed = speed * self.speed_priors.get(voice).copied().unwrap_or(1.0);
-
-        let input_ids = Array2::from_shape_vec((1, tokens.len()), tokens)
-            .context("failed building input_ids tensor")?;
-        let style = Array2::from_shape_vec((1, style.len()), style)
-            .context("failed building style tensor")?;
-        let speed = Array1::from_vec(vec![adjusted_speed]);
-
-        let outputs = self.session.run(inputs![
-            "input_ids" => Tensor::from_array(input_ids)?,
-            "style" => Tensor::from_array(style)?,
-            "speed" => Tensor::from_array(speed)?
-        ])?;
-
-        if outputs.len() == 0 {
-            bail!("onnx model returned no output tensors");
-        }
-        let first_output = &outputs[0];
-        let (_, data) = first_output
-            .try_extract_tensor::<f32>()
-            .context("failed extracting f32 output tensor")?;
-        let mut audio = data.to_vec();
-
-        if trim_tail >= audio.len() {
-            audio.clear();
-        } else {
-            let keep = audio.len() - trim_tail;
-            audio.truncate(keep);
-        }
-
-        Ok(audio)
-    }
-}
-
-fn resolve_style_index(
-    max_rows: usize,
-    explicit_style_index: Option<usize>,
-    rng: &mut SimpleRng,
-) -> usize {
-    if max_rows == 0 {
-        return 0;
-    }
-    let max_index = max_rows.saturating_sub(1);
-    match explicit_style_index {
-        Some(i) => usize::min(i, max_index),
-        None => rng.gen_index(max_rows),
-    }
-}
-
 fn runtime_entropy_seed() -> u64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1295,130 +528,6 @@ fn load_last_random_voice(path: &Path) -> Option<String> {
 fn store_last_random_voice(path: &Path, voice: &str) -> Result<()> {
     fs::write(path, voice)
         .with_context(|| format!("failed writing random voice state file {}", path.display()))
-}
-
-fn check_gpu_vram(device_id: i32, arena_mib: u64) -> Result<()> {
-    let output = match Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=memory.free",
-            "--format=csv,noheader,nounits",
-            &format!("--id={device_id}"),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => {
-            eprintln!("warning: nvidia-smi not found; skipping VRAM availability check");
-            return Ok(());
-        }
-    };
-
-    if !output.status.success() {
-        eprintln!("warning: nvidia-smi failed; skipping VRAM availability check");
-        return Ok(());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let free_mib: u64 = match stdout.trim().parse() {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("warning: could not parse nvidia-smi output; skipping VRAM check");
-            return Ok(());
-        }
-    };
-
-    let needed = arena_mib + VRAM_HEADROOM_MIB;
-    if free_mib < needed {
-        bail!(
-            "insufficient GPU VRAM on device {device_id}: {free_mib} MiB free, \
-             but ~{needed} MiB needed ({arena_mib} MiB arena + {VRAM_HEADROOM_MIB} MiB headroom). \
-             Lower --cuda-memory-limit or close GPU-intensive applications to avoid a system crash"
-        );
-    }
-
-    eprintln!("GPU device {device_id}: {free_mib} MiB free VRAM (need ~{needed} MiB)");
-    Ok(())
-}
-
-fn resolve_ort_lib(config: &OrtRuntimeConfig) -> PathBuf {
-    // Priority order:
-    // 1. --ort-lib CLI argument
-    // 2. ORT_DYLIB_PATH environment variable
-    // 3. Bundled next to executable (for releases)
-    // 4. System library search (for existing installations)
-
-    if let Some(ref lib) = config.ort_lib {
-        return lib.clone();
-    }
-
-    if let Some(path) = std::env::var_os("ORT_DYLIB_PATH").map(PathBuf::from) {
-        return path;
-    }
-
-    #[cfg(target_os = "windows")]
-    let lib = "onnxruntime.dll";
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let lib = "libonnxruntime.so";
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    let lib = "libonnxruntime.dylib";
-
-    if let Ok(exe_path) = std::env::current_exe() {
-        let mut bundled = exe_path;
-        bundled.pop();
-        bundled.push(lib);
-        if bundled.exists() {
-            return bundled;
-        }
-    }
-
-    // Fall back to system library (let dynamic linker find it)
-    PathBuf::from(lib)
-}
-
-fn init_ort(config: &OrtRuntimeConfig) -> Result<()> {
-    ORT_INIT.get_or_try_init(|| -> Result<()> {
-        if config.cuda_lib_dir.is_some() || config.cudnn_lib_dir.is_some() {
-            ep::cuda::preload_dylibs(
-                config.cuda_lib_dir.as_deref(),
-                config.cudnn_lib_dir.as_deref(),
-            )
-            .context("failed preloading CUDA/cuDNN shared libraries")?;
-        } else if config.ort_lib.is_none() {
-            // Auto-preload bundled CUDA libraries when no explicit paths provided
-            if let Ok(exe_path) = std::env::current_exe() {
-                let mut cuda_dir = exe_path;
-                cuda_dir.pop();
-                if cuda_dir.join("libcublasLt.so.12").exists() {
-                    ep::cuda::preload_dylibs(Some(cuda_dir.as_path()), None)
-                        .context("failed preloading bundled CUDA libraries")?;
-                }
-            }
-        }
-
-        let ort_lib = resolve_ort_lib(config);
-
-        let _ = ort::init_from(&ort_lib)
-            .with_context(|| {
-                format!(
-                    "failed loading ONNX Runtime shared library from {}",
-                    ort_lib.display()
-                )
-            })?
-            .with_name("kitten-tts")
-            .commit();
-
-        Ok(())
-    })?;
-    Ok(())
-}
-
-fn tokenize_phonemes(cleaner: &TextCleaner, phonemes: &str) -> Vec<i64> {
-    let mut tokens = Vec::new();
-    let collapsed = SPACES_RE.replace_all(phonemes.trim(), " ");
-    cleaner.encode_into(&collapsed, &mut tokens);
-    tokens
 }
 
 fn clean_text_basic(text: &str) -> String {
@@ -1545,117 +654,6 @@ fn chunk_text(text: &str, max_len: usize) -> Vec<String> {
     chunks
 }
 
-fn safe_file_name(value: &str) -> Result<&str> {
-    let path = Path::new(value);
-    for component in path.components() {
-        match component {
-            Component::Normal(_) => {}
-            _ => bail!("unsafe file path in model config: '{value}'"),
-        }
-    }
-
-    if value.contains('/') || value.contains('\\') {
-        bail!("unsafe nested file path in model config: '{value}'");
-    }
-    Ok(value)
-}
-
-fn cache_model_dir(cache_root: &Path, repo_id: &str) -> PathBuf {
-    let mut hasher = Sha256::new();
-    hasher.update(repo_id.as_bytes());
-    let digest = hasher.finalize();
-    let short = hex::encode(&digest[..8]);
-    let sanitized: String = repo_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
-    cache_root
-        .join("models")
-        .join(format!("{sanitized}_{short}"))
-}
-
-fn ensure_model_cached(
-    client: &Client,
-    cache_root: &Path,
-    repo_id: &str,
-    force: bool,
-) -> Result<ModelArtifacts> {
-    let model_dir = cache_model_dir(cache_root, repo_id);
-    fs::create_dir_all(&model_dir)
-        .with_context(|| format!("failed creating cache dir {}", model_dir.display()))?;
-    let mut cache_updated = false;
-
-    let config_path = model_dir.join("config.json");
-    if force || !config_path.exists() {
-        download_repo_file(client, repo_id, "config.json", &config_path)
-            .with_context(|| format!("failed downloading config.json for {repo_id}"))?;
-        cache_updated = true;
-    }
-
-    let config: ModelConfig = serde_json::from_str(
-        &fs::read_to_string(&config_path)
-            .with_context(|| format!("failed reading config at {}", config_path.display()))?,
-    )
-    .with_context(|| format!("failed parsing config at {}", config_path.display()))?;
-
-    if config.model_type != "ONNX1" && config.model_type != "ONNX2" {
-        bail!(
-            "unsupported model type '{}': expected ONNX1 or ONNX2",
-            config.model_type
-        );
-    }
-
-    let model_file = safe_file_name(&config.model_file)?;
-    let voices_file = safe_file_name(&config.voices)?;
-
-    let model_path = model_dir.join(model_file);
-    let voices_path = model_dir.join(voices_file);
-
-    if force || !model_path.exists() {
-        download_repo_file(client, repo_id, model_file, &model_path)
-            .with_context(|| format!("failed downloading model file {model_file}"))?;
-        cache_updated = true;
-    }
-
-    if force || !voices_path.exists() {
-        download_repo_file(client, repo_id, voices_file, &voices_path)
-            .with_context(|| format!("failed downloading voices file {voices_file}"))?;
-        cache_updated = true;
-    }
-
-    let manifest_path = model_dir.join("manifest.json");
-    if cache_updated || !manifest_path.exists() {
-        let manifest = CacheManifest {
-            repo_id: repo_id.to_string(),
-            fetched_at_unix: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            model_file: model_file.to_string(),
-            voices_file: voices_file.to_string(),
-        };
-        let manifest_json = serde_json::to_string_pretty(&manifest)?;
-        fs::write(&manifest_path, manifest_json)
-            .with_context(|| format!("failed writing manifest at {}", manifest_path.display()))?;
-    }
-
-    Ok(ModelArtifacts {
-        repo_id: repo_id.to_string(),
-        cache_dir: model_dir,
-        config_path,
-        model_path,
-        voices_path,
-        config,
-    })
-}
-
 fn download_repo_file(client: &Client, repo_id: &str, file_name: &str, dest: &Path) -> Result<()> {
     let url = format!("https://huggingface.co/{repo_id}/resolve/main/{file_name}?download=true");
 
@@ -1675,6 +673,7 @@ fn download_repo_file(client: &Client, repo_id: &str, file_name: &str, dest: &Pa
             .with_context(|| format!("failed writing to temp file {}", temp_path.display()))?;
         file.flush()?;
         verify_download_size(expected_len, written, &url)?;
+        validate_native_gguf(&temp_path)?;
 
         fs::rename(&temp_path, dest).with_context(|| {
             format!(
@@ -1844,117 +843,6 @@ fn play_audio(
     Ok(())
 }
 
-fn parse_npy_f32(bytes: &[u8]) -> Result<(usize, usize, Vec<f32>)> {
-    if bytes.len() < 12 {
-        bail!("npy payload too small");
-    }
-    if &bytes[0..6] != b"\x93NUMPY" {
-        bail!("invalid npy magic header");
-    }
-
-    let major = bytes[6];
-    let (header_len, header_offset) = match major {
-        1 => {
-            let h = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
-            (h, 10_usize)
-        }
-        2 | 3 => {
-            let h = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
-            (h, 12_usize)
-        }
-        other => bail!("unsupported npy version {other}"),
-    };
-
-    let header_end = header_offset
-        .checked_add(header_len)
-        .ok_or_else(|| anyhow!("npy header length overflow"))?;
-    if bytes.len() < header_end {
-        bail!("npy header length exceeds payload size");
-    }
-    let header = std::str::from_utf8(&bytes[header_offset..header_end])
-        .context("npy header is not valid utf-8")?;
-
-    let descr = parse_header_field(header, "descr")
-        .ok_or_else(|| anyhow!("npy header missing 'descr' field"))?;
-    let fortran = parse_header_field(header, "fortran_order")
-        .ok_or_else(|| anyhow!("npy header missing 'fortran_order' field"))?;
-    let shape = parse_shape(header).ok_or_else(|| anyhow!("npy header missing 'shape' field"))?;
-
-    if descr != "<f4" {
-        bail!("unsupported npy dtype '{descr}', expected '<f4'");
-    }
-    if fortran != "False" {
-        bail!("unsupported npy order '{fortran}', expected 'False'");
-    }
-    if shape.len() != 2 {
-        bail!("expected 2D style tensor shape, got {shape:?}");
-    }
-
-    let rows = shape[0];
-    let cols = shape[1];
-    let item_count = rows
-        .checked_mul(cols)
-        .ok_or_else(|| anyhow!("npy shape overflow for {rows}x{cols}"))?;
-    let expected_data_bytes = item_count
-        .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| anyhow!("npy byte size overflow for {rows}x{cols}"))?;
-
-    let data_bytes = &bytes[header_end..];
-    if data_bytes.len() != expected_data_bytes {
-        bail!(
-            "npy data size mismatch: expected {} bytes, got {}",
-            expected_data_bytes,
-            data_bytes.len()
-        );
-    }
-
-    let mut data = Vec::with_capacity(item_count);
-    for chunk in data_bytes.chunks_exact(4) {
-        data.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-
-    Ok((rows, cols, data))
-}
-
-fn parse_header_field<'a>(header: &'a str, key: &str) -> Option<&'a str> {
-    let pattern = format!("'{key}':");
-    let start = header.find(&pattern)? + pattern.len();
-    let rest = header[start..].trim_start();
-
-    if let Some(stripped) = rest.strip_prefix('"') {
-        let end = stripped.find('"')?;
-        return Some(&stripped[..end]);
-    }
-    if let Some(stripped) = rest.strip_prefix('\'') {
-        let end = stripped.find('\'')?;
-        return Some(&stripped[..end]);
-    }
-
-    let end = rest.find([',', '}']).unwrap_or(rest.len());
-    Some(rest[..end].trim())
-}
-
-fn parse_shape(header: &str) -> Option<Vec<usize>> {
-    let marker = "'shape':";
-    let start = header.find(marker)? + marker.len();
-    let rest = header[start..].trim_start();
-    let tuple_start = rest.find('(')?;
-    let tuple_rest = &rest[tuple_start + 1..];
-    let tuple_end = tuple_rest.find(')')?;
-    let shape_text = &tuple_rest[..tuple_end];
-
-    let mut shape = Vec::new();
-    for part in shape_text.split(',') {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        shape.push(trimmed.parse::<usize>().ok()?);
-    }
-
-    Some(shape)
-}
-
 fn resolve_cache_root(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
@@ -1973,162 +861,21 @@ fn build_http_client() -> Result<Client> {
         .context("failed building HTTP client")
 }
 
-enum SynthesisBackend {
-    Onnx {
-        synthesizer: Synthesizer,
-        phonemizer: Box<dyn Phonemizer>,
-    },
-    Native(NativeSynth),
-}
-
-impl SynthesisBackend {
-    fn synthesize(
-        &mut self,
-        text: &str,
-        voice: Option<&str>,
-        config: SynthesisConfig,
-    ) -> Result<Vec<f32>> {
-        match self {
-            Self::Onnx {
-                synthesizer,
-                phonemizer,
-            } => synthesizer.synthesize(text, voice, config, phonemizer.as_ref()),
-            Self::Native(synthesizer) => synthesizer.synthesize(text, voice, config),
-        }
-    }
-
-    fn synthesize_streaming(
-        &mut self,
-        text: &str,
-        voice: Option<&str>,
-        config: SynthesisConfig,
-        on_chunk: impl FnMut(&[f32]) -> Result<()>,
-    ) -> Result<()> {
-        match self {
-            Self::Onnx {
-                synthesizer,
-                phonemizer,
-            } => {
-                synthesizer.synthesize_streaming(text, voice, config, phonemizer.as_ref(), on_chunk)
-            }
-            Self::Native(synthesizer) => {
-                synthesizer.synthesize_streaming(text, voice, config, on_chunk)
-            }
-        }
-    }
-}
-
-fn prepare_synthesis_runtime(args: &SynthesisArgs) -> Result<(String, SynthesisBackend)> {
+fn prepare_synthesis_runtime(args: &SynthesisArgs) -> Result<(String, NativeSynth)> {
     let text = read_text_input(&args.text)?;
-
-    match args.engine {
-        EngineChoice::Onnx => Ok((text, prepare_onnx_backend(args)?)),
-        EngineChoice::Native => Ok((text, prepare_native_backend(args)?)),
-        EngineChoice::Auto => match auto_native_intent(args) {
-            AutoNativeIntent::Required => Ok((text, prepare_native_backend(args)?)),
-            AutoNativeIntent::Opportunistic => match prepare_native_backend(args) {
-                Ok(backend) => Ok((text, backend)),
-                Err(err) => {
-                    eprintln!(
-                        "note: native engine unavailable ({err:#}); falling back to ONNX Runtime"
-                    );
-                    Ok((text, prepare_onnx_backend(args)?))
-                }
-            },
-            AutoNativeIntent::None => Ok((text, prepare_onnx_backend(args)?)),
-        },
-    }
+    prepare_native_chunks(&text, args.speed, args.max_chars)?;
+    Ok((text, prepare_native_backend(args)?))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AutoNativeIntent {
-    Required,
-    Opportunistic,
-    None,
-}
-
-fn auto_native_intent(args: &SynthesisArgs) -> AutoNativeIntent {
-    if args.native_model.is_some()
-        || args.native_lib.is_some()
-        || args.native_family == NativeFamily::KittenTts2
-        || args.native_espeak_lib.is_some()
-        || args.native_espeak_data.is_some()
-    {
-        AutoNativeIntent::Required
-    } else if args.model.model == Some(ModelPreset::Mini08) {
-        AutoNativeIntent::Opportunistic
-    } else if native_serves_default_request(args) {
-        // macOS cannot run the ONNX path, which requires CUDA. A plain request
-        // therefore uses the native Mini 0.8 package and falls back to ONNX only
-        // when the native library is missing.
-        AutoNativeIntent::Opportunistic
-    } else {
-        AutoNativeIntent::None
-    }
-}
-
-fn native_serves_default_request(args: &SynthesisArgs) -> bool {
-    cfg!(target_os = "macos") && args.model.model.is_none() && !onnx_only_selection(args)
-}
-
-fn onnx_only_selection(args: &SynthesisArgs) -> bool {
-    args.model.repo_id.is_some()
-        || args.model.ort_lib.is_some()
-        || args.model.cuda_lib_dir.is_some()
-        || args.model.cudnn_lib_dir.is_some()
-        || args.model.cuda_device_id.is_some()
-        || args.model.cuda_memory_limit.is_some()
-        || args.model.vram_profile.is_some()
-        || args.model.arena_strategy != ArenaStrategy::SameAsRequested
-        || args.model.conv_algo != ConvAlgo::Heuristic
-        || args.model.graph_opt != GraphOpt::Level1
-        || args.model.memory_pattern
-        || args.model.parallel_execution
-        || args.style_index.is_some()
-        || args.trim_tail != DEFAULT_TRIM_TAIL
-        || args.phonemizer != PhonemizerMode::EspeakNg
-}
-
-fn prepare_onnx_backend(args: &SynthesisArgs) -> Result<SynthesisBackend> {
-    let client = build_http_client()?;
-    let cache_root = args.model.resolve_cache_dir()?;
-    let repo_id = args.model.resolve_repo_id();
-    let ort_runtime = args.model.resolve_ort_runtime_config();
-    let artifacts = ensure_model_cached(&client, &cache_root, &repo_id, false)?;
-    let synthesizer = Synthesizer::new(&artifacts, &ort_runtime)?;
-    let phonemizer = detect_phonemizer(args.phonemizer)?;
-    Ok(SynthesisBackend::Onnx {
-        synthesizer,
-        phonemizer,
-    })
-}
-
-fn prepare_native_backend(args: &SynthesisArgs) -> Result<SynthesisBackend> {
+fn prepare_native_backend(args: &SynthesisArgs) -> Result<NativeSynth> {
     validate_native_args(args)?;
 
-    if args.phonemizer != PhonemizerMode::EspeakNg {
-        eprintln!(
-            "note: the native engine uses its built-in eSpeak-ng frontend; --phonemizer is ignored"
-        );
-    }
-    if args.trim_tail != DEFAULT_TRIM_TAIL {
-        eprintln!("note: --trim-tail is ONNX-only and is ignored by the native engine");
-    }
     if args.native_family == NativeFamily::KittenTts2 && (args.speed - 1.0).abs() > 1e-6 {
         eprintln!("note: the kitten_tts2 port does not implement --speed; using its default rate");
     }
 
-    if args.native_model.is_none() && args.model.model.is_none() {
-        eprintln!(
-            "[Native] using KittenTTS Mini 0.8, the only packaged native model (the ONNX default preset does not apply)"
-        );
-    }
-
     let library_path = resolve_native_lib_path(args.native_lib.as_deref());
-    // Check the local prerequisites before any network access. A missing or
-    // ABI-incompatible library makes this path unusable, and `auto` turns that
-    // into an ONNX fallback, so downloading the 288 MiB GGUF first would stall
-    // and waste bandwidth on an engine that cannot run.
+    // Check local prerequisites before downloading weights.
     drop(open_native_library(&library_path)?);
     let (espeak_lib, espeak_data) = if args.native_family == NativeFamily::KittenTts {
         (
@@ -2172,31 +919,15 @@ fn prepare_native_backend(args: &SynthesisArgs) -> Result<SynthesisBackend> {
         load_started.elapsed().as_millis()
     );
 
-    Ok(SynthesisBackend::Native(synthesizer))
+    Ok(synthesizer)
 }
 
 fn validate_native_args(args: &SynthesisArgs) -> Result<()> {
+    if args.sample_rate != DEFAULT_SAMPLE_RATE {
+        bail!("native output is fixed at {DEFAULT_SAMPLE_RATE} Hz; omit --sample-rate");
+    }
     if !(1..=256).contains(&args.native_threads) {
         bail!("--native-threads must be between 1 and 256");
-    }
-    if args.style_index.is_some() {
-        bail!("--style-index is not supported by the native engine; omit it or pass --engine onnx");
-    }
-    if args.model.vram_profile.is_some() {
-        bail!("--vram-profile is ONNX-only; omit it or pass --engine onnx");
-    }
-    if args.model.repo_id.is_some() {
-        bail!(
-            "--repo-id selects an ONNX repository and cannot be combined with the native engine; pass --native-model PATH instead"
-        );
-    }
-    if args.native_model.is_none()
-        && let Some(preset) = args.model.model
-        && preset != ModelPreset::Mini08
-    {
-        bail!(
-            "the native engine currently provides only the KittenTTS Mini 0.8 package; pass --model mini-0.8 or --native-model PATH"
-        );
     }
     if args.native_family == NativeFamily::KittenTts2 {
         if !args.accept_kitten2_license {
@@ -2836,6 +1567,16 @@ fn should_retry_on_cpu(auto_backend: bool, backend: &str, err: &anyhow::Error) -
     auto_backend && backend != "cpu" && err.downcast_ref::<NativeAudioError>().is_some()
 }
 
+fn validate_native_audio(audio: &[f32]) -> Result<()> {
+    if let Some(index) = audio.iter().position(|sample| !sample.is_finite()) {
+        return Err(NativeAudioError::NonFinite(index).into());
+    }
+    if audio.iter().all(|sample| sample.abs() < 1e-6) {
+        return Err(NativeAudioError::Silent.into());
+    }
+    Ok(())
+}
+
 impl Drop for NativeSynth {
     fn drop(&mut self) {
         // SAFETY: each handle was produced by this library and is freed at most
@@ -3156,7 +1897,11 @@ impl NativeSynth {
         }
 
         let mut rng = SimpleRng::from_seed(seed.unwrap_or_else(runtime_entropy_seed));
-        let previous = load_last_random_voice(&self.random_voice_state_path);
+        let previous = if seed.is_none() {
+            load_last_random_voice(&self.random_voice_state_path)
+        } else {
+            None
+        };
         let mut candidates = canonical.to_vec();
         if let Some(previous) = previous
             && candidates.len() > 1
@@ -3264,8 +2009,8 @@ impl NativeSynth {
             if channels <= 0 {
                 bail!("native engine reported an invalid channel count: {channels}");
             }
-            if sample_rate <= 0 {
-                bail!("native engine reported an invalid sample rate: {sample_rate}");
+            if sample_rate != DEFAULT_SAMPLE_RATE as c_int {
+                bail!("native engine reported {sample_rate} Hz; expected {DEFAULT_SAMPLE_RATE} Hz");
             }
 
             let channels = channels as usize;
@@ -3283,12 +2028,7 @@ impl NativeSynth {
                     .collect()
             };
 
-            if let Some(index) = audio.iter().position(|sample| !sample.is_finite()) {
-                return Err(NativeAudioError::NonFinite(index).into());
-            }
-            if audio.iter().all(|sample| sample.abs() < 1e-6) {
-                return Err(NativeAudioError::Silent.into());
-            }
+            validate_native_audio(&audio)?;
 
             Ok(audio)
         })();
@@ -3336,32 +2076,11 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Models(models) => match models.command {
             ModelsCommands::List => {
-                println!(
-                    "Default preset: {} ({DEFAULT_REPO_ID})",
-                    default_preset_label()
-                );
-                for preset in ModelPreset::all() {
-                    let marker = if preset.repo_id() == DEFAULT_REPO_ID {
-                        " (default)"
-                    } else {
-                        ""
-                    };
-                    println!(
-                        "- {} -> {}{}",
-                        format_model_preset(preset),
-                        preset.repo_id(),
-                        marker
-                    );
-                }
-                println!();
-                println!("Native engine (optional, no ONNX Runtime):");
-                println!("- {NATIVE_KITTEN_TTS_DIR}/{NATIVE_KITTEN_TTS_FILE} (about 288 MiB)");
-                println!("  download with: kitten-tts native fetch [--cache-dir DIR] [--force]");
-                println!(
-                    "  used by: kitten-tts synthesize --engine native --model mini-0.8 --native-lib PATH"
-                );
-                println!("  check the library first: kitten-tts native probe --native-lib PATH");
-                println!("  check library + eSpeak + model at once: kitten-tts native doctor");
+                println!("Default: mini-0.8 (native audio.cpp, about 288 MiB)");
+                println!("- {NATIVE_MODEL_REPO}/{NATIVE_KITTEN_TTS_DIR}/{NATIVE_KITTEN_TTS_FILE}");
+                println!("  download: kitten-tts native fetch");
+                println!("- kitten_tts2: local GGUF + --accept-kitten2-license required");
+                println!("  check: kitten-tts native doctor");
             }
         },
         Commands::Native(native_cmd) => match native_cmd.command {
@@ -3369,49 +2088,12 @@ fn main() -> Result<()> {
             NativeCommands::Fetch(args) => fetch_native_model(&args)?,
             NativeCommands::Doctor(args) => doctor_native_runtime(&args)?,
         },
-        Commands::Model(model_cmd) => {
-            let client = build_http_client()?;
-            match model_cmd.command {
-                ModelCommands::Fetch(args) => {
-                    let cache_root = args.model.resolve_cache_dir()?;
-                    let repo_id = args.model.resolve_repo_id();
-                    let artifacts =
-                        ensure_model_cached(&client, &cache_root, &repo_id, args.force)?;
-                    println!("Fetched model into {}", artifacts.cache_dir.display());
-                    println!("Repo: {}", artifacts.repo_id);
-                    println!("Model: {}", artifacts.model_path.display());
-                    println!("Voices: {}", artifacts.voices_path.display());
-                }
-                ModelCommands::Info(args) => {
-                    let cache_root = args.model.resolve_cache_dir()?;
-                    let repo_id = args.model.resolve_repo_id();
-                    let artifacts = ensure_model_cached(&client, &cache_root, &repo_id, false)?;
-                    println!("Repo: {}", artifacts.repo_id);
-                    println!("Cache dir: {}", artifacts.cache_dir.display());
-                    println!("Config: {}", artifacts.config_path.display());
-                    println!("Model: {}", artifacts.model_path.display());
-                    println!("Voices: {}", artifacts.voices_path.display());
-                    println!("Aliases: {}", artifacts.config.voice_aliases.len());
-                }
-            }
-        }
         Commands::Voices(args) => {
-            let client = build_http_client()?;
-            let cache_root = args.model.resolve_cache_dir()?;
-            let repo_id = args.model.resolve_repo_id();
-            let artifacts = ensure_model_cached(&client, &cache_root, &repo_id, false)?;
-            let voice_table = VoiceTable::load(&artifacts.voices_path)?;
-
-            println!("Repo: {}", artifacts.repo_id);
-            println!("Canonical voices:");
-            for voice in voice_table.canonical_voices() {
-                println!("- {voice}");
+            for voice in args.native_family.canonical_voices() {
+                println!("{voice}");
             }
-            println!("Aliases:");
-            let mut aliases: Vec<_> = artifacts.config.voice_aliases.iter().collect();
-            aliases.sort_by(|a, b| a.0.cmp(b.0));
-            for (alias, canonical) in aliases {
-                println!("- {alias} -> {canonical}");
+            if args.native_family == NativeFamily::KittenTts2 {
+                println!("KittenTTS 2 uses the model default voice when --voice is omitted.");
             }
         }
         Commands::Play(args) => {
@@ -3465,89 +2147,9 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn format_model_preset(preset: ModelPreset) -> &'static str {
-    match preset {
-        ModelPreset::Nano08Int8 => "nano-0.8-int8",
-        ModelPreset::Nano08Fp32 => "nano-0.8-fp32",
-        ModelPreset::Micro08 => "micro-0.8",
-        ModelPreset::Mini08 => "mini-0.8",
-    }
-}
-
-fn default_preset_label() -> &'static str {
-    for preset in ModelPreset::all() {
-        if preset.repo_id() == DEFAULT_REPO_ID {
-            return format_model_preset(preset);
-        }
-    }
-    "custom"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn model_selection_defaults_to_nano_fp32() {
-        let selection = ModelSelection {
-            model: None,
-            repo_id: None,
-            cache_dir: None,
-            ort_lib: None,
-            cuda_lib_dir: None,
-            cudnn_lib_dir: None,
-            cuda_device_id: None,
-            cuda_memory_limit: None,
-            arena_strategy: ArenaStrategy::SameAsRequested,
-            conv_algo: ConvAlgo::Heuristic,
-            graph_opt: GraphOpt::Level1,
-            memory_pattern: false,
-            parallel_execution: false,
-            vram_profile: None,
-        };
-        assert_eq!(selection.resolve_repo_id(), DEFAULT_REPO_ID);
-    }
-
-    #[test]
-    fn repo_id_overrides_model_preset() {
-        let selection = ModelSelection {
-            model: Some(ModelPreset::Micro08),
-            repo_id: Some("KittenML/custom".to_string()),
-            cache_dir: None,
-            ort_lib: None,
-            cuda_lib_dir: None,
-            cudnn_lib_dir: None,
-            cuda_device_id: None,
-            cuda_memory_limit: None,
-            arena_strategy: ArenaStrategy::SameAsRequested,
-            conv_algo: ConvAlgo::Heuristic,
-            graph_opt: GraphOpt::Level1,
-            memory_pattern: false,
-            parallel_execution: false,
-            vram_profile: None,
-        };
-        assert_eq!(selection.resolve_repo_id(), "KittenML/custom");
-    }
-
-    #[test]
-    fn test_tokenize_phonemes_spacing() {
-        let cleaner = TextCleaner::new();
-        let phonemes = "hɛloʊ, wɜːld.";
-        let tokens = tokenize_phonemes(&cleaner, phonemes);
-
-        let mut decoded = String::new();
-        let reverse_map: std::collections::HashMap<i64, char> = cleaner
-            .word_index_dictionary
-            .iter()
-            .map(|(&k, &v)| (v, k))
-            .collect();
-        for t in tokens {
-            if let Some(c) = reverse_map.get(&t) {
-                decoded.push(*c);
-            }
-        }
-        assert_eq!(decoded, "hɛloʊ, wɜːld."); // This will fail if it injects spaces
-    }
 
     #[test]
     fn chunking_retains_punctuation() {
@@ -3571,63 +2173,9 @@ mod tests {
     }
 
     #[test]
-    fn cache_dir_is_stable_for_same_repo() {
-        let root = Path::new("/tmp/kitten");
-        let a = cache_model_dir(root, "KittenML/kitten-tts-nano-0.8-int8");
-        let b = cache_model_dir(root, "KittenML/kitten-tts-nano-0.8-int8");
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn parse_shape_extracts_expected_values() {
-        let header = "{'descr': '<f4', 'fortran_order': False, 'shape': (400, 256), }";
-        assert_eq!(parse_shape(header), Some(vec![400, 256]));
-    }
-
-    #[test]
-    fn parse_npy_rejects_shape_that_overflows_byte_count() {
-        let header = format!(
-            "{{'descr': '<f4', 'fortran_order': False, 'shape': ({}, 1), }}",
-            usize::MAX
-        );
-        let mut payload = Vec::new();
-        payload.extend_from_slice(b"\x93NUMPY");
-        payload.push(2);
-        payload.push(0);
-        payload.extend_from_slice(&(header.len() as u32).to_le_bytes());
-        payload.extend_from_slice(header.as_bytes());
-
-        let err = parse_npy_f32(&payload).expect_err("overflow shape should be rejected");
-        assert!(format!("{err:#}").contains("npy byte size overflow"));
-    }
-
-    #[test]
     fn clean_text_collapses_whitespace() {
         let text = "  hello   world\n\tfoo  ";
         assert_eq!(clean_text_basic(text), "hello world foo");
-    }
-
-    #[test]
-    fn resolve_style_index_defaults_to_seeded_random_in_range() {
-        let mut a = SimpleRng::from_seed(1234);
-        let mut b = SimpleRng::from_seed(1234);
-        let idx_a = resolve_style_index(400, None, &mut a);
-        let idx_b = resolve_style_index(400, None, &mut b);
-        assert_eq!(idx_a, idx_b);
-        assert!(idx_a < 400);
-    }
-
-    #[test]
-    fn resolve_style_index_honors_override_and_clamps() {
-        let mut rng = SimpleRng::from_seed(42);
-        assert_eq!(resolve_style_index(400, Some(4), &mut rng), 4);
-        assert_eq!(resolve_style_index(400, Some(9999), &mut rng), 399);
-    }
-
-    #[test]
-    fn resolve_style_index_handles_empty_rows() {
-        let mut rng = SimpleRng::from_seed(1);
-        assert_eq!(resolve_style_index(0, None, &mut rng), 0);
     }
 
     #[test]
@@ -3648,86 +2196,6 @@ mod tests {
         assert_eq!(applied, 2.0);
         assert!((scaled[0] - 1.0).abs() < 1e-6);
         assert!((scaled[1] + 0.5).abs() < 1e-6);
-    }
-
-    fn default_ort_config() -> OrtRuntimeConfig {
-        OrtRuntimeConfig {
-            ort_lib: None,
-            cuda_lib_dir: None,
-            cudnn_lib_dir: None,
-            cuda_device_id: DEFAULT_CUDA_DEVICE_ID,
-            cuda_memory_limit_bytes: DEFAULT_CUDA_MEMORY_LIMIT_BYTES,
-            arena_strategy: ArenaStrategy::SameAsRequested,
-            conv_algo: ConvAlgo::Heuristic,
-            graph_opt: GraphOpt::Level1,
-            memory_pattern: false,
-            parallel_execution: false,
-            vram_profile: None,
-        }
-    }
-
-    #[test]
-    fn resolve_session_config_performance_profile_overrides_individual_flags() {
-        let mut cfg = default_ort_config();
-        cfg.vram_profile = Some(VramProfile::Performance);
-        // Individual flags are still at conservative defaults, but profile wins
-        let resolved = resolve_session_config(&cfg);
-        assert_eq!(resolved.arena_strategy, ArenaStrategy::NextPowerOfTwo);
-        assert_eq!(resolved.conv_algo, ConvAlgo::Exhaustive);
-        assert_eq!(resolved.graph_opt, GraphOpt::Level3);
-        assert!(resolved.memory_pattern);
-        assert!(resolved.parallel_execution);
-    }
-
-    #[test]
-    fn resolve_session_config_minimal_profile_forces_conservative() {
-        let mut cfg = default_ort_config();
-        cfg.vram_profile = Some(VramProfile::Minimal);
-        // Even if individual flags are aggressive, profile overrides
-        cfg.arena_strategy = ArenaStrategy::NextPowerOfTwo;
-        cfg.conv_algo = ConvAlgo::Exhaustive;
-        cfg.graph_opt = GraphOpt::Level3;
-        cfg.memory_pattern = true;
-        cfg.parallel_execution = true;
-        let resolved = resolve_session_config(&cfg);
-        assert_eq!(resolved.arena_strategy, ArenaStrategy::SameAsRequested);
-        assert_eq!(resolved.conv_algo, ConvAlgo::Heuristic);
-        assert_eq!(resolved.graph_opt, GraphOpt::Level1);
-        assert!(!resolved.memory_pattern);
-        assert!(!resolved.parallel_execution);
-        assert_eq!(resolved.inter_threads, SAFE_INTER_THREADS);
-    }
-
-    #[test]
-    fn resolve_session_config_no_profile_passes_individual_flags() {
-        let mut cfg = default_ort_config();
-        cfg.arena_strategy = ArenaStrategy::NextPowerOfTwo;
-        cfg.conv_algo = ConvAlgo::Exhaustive;
-        cfg.graph_opt = GraphOpt::Level3;
-        cfg.memory_pattern = true;
-        let resolved = resolve_session_config(&cfg);
-        assert_eq!(resolved.arena_strategy, ArenaStrategy::NextPowerOfTwo);
-        assert_eq!(resolved.conv_algo, ConvAlgo::Exhaustive);
-        assert_eq!(resolved.graph_opt, GraphOpt::Level3);
-        assert!(resolved.memory_pattern);
-    }
-
-    #[test]
-    fn resolve_session_config_parallel_enables_inter_threads() {
-        let mut cfg = default_ort_config();
-        cfg.parallel_execution = true;
-        let resolved = resolve_session_config(&cfg);
-        assert!(resolved.parallel_execution);
-        // inter_threads must be > 1 (or 0 = auto) for parallel to work
-        assert_ne!(resolved.inter_threads, SAFE_INTER_THREADS);
-    }
-
-    #[test]
-    fn resolve_session_config_no_parallel_keeps_safe_inter_threads() {
-        let cfg = default_ort_config();
-        let resolved = resolve_session_config(&cfg);
-        assert!(!resolved.parallel_execution);
-        assert_eq!(resolved.inter_threads, SAFE_INTER_THREADS);
     }
 
     #[test]
@@ -3778,63 +2246,134 @@ mod tests {
     }
 
     #[test]
-    fn engine_defaults_to_auto() {
-        assert_eq!(parse_synthesis_args(&[]).engine, EngineChoice::Auto);
-    }
-
-    #[test]
-    fn auto_engine_uses_native_for_default_request_on_macos() {
-        let expected = if cfg!(target_os = "macos") {
-            AutoNativeIntent::Opportunistic
-        } else {
-            AutoNativeIntent::None
-        };
-        assert_eq!(auto_native_intent(&parse_synthesis_args(&[])), expected);
-    }
-
-    #[test]
-    fn auto_engine_is_opportunistic_for_mini() {
+    fn native_mini_is_the_default_on_every_platform() {
+        let args = parse_synthesis_args(&[]);
+        assert_eq!(args.engine, EngineChoice::Native);
+        assert_eq!(args.model.model, ModelPreset::Mini08);
+        assert_eq!(args.native_family, NativeFamily::KittenTts);
+        assert!(validate_native_args(&args).is_ok());
         assert_eq!(
-            auto_native_intent(&parse_synthesis_args(&["--model", "mini-0.8"])),
-            AutoNativeIntent::Opportunistic
+            parse_synthesis_args(&["--engine", "auto"]).engine,
+            EngineChoice::Auto
         );
     }
 
     #[test]
-    fn auto_engine_keeps_onnx_for_onnx_only_selection() {
+    fn removed_onnx_options_are_cli_errors() {
         for extra in [
+            vec!["--engine", "onnx"],
             vec!["--model", "nano-0.8-fp32"],
-            vec!["--style-index", "3"],
-            vec!["--phonemizer", "auto"],
-            vec!["--trim-tail", "6000"],
-            vec!["--repo-id", "someone/custom"],
-            vec!["--arena-strategy", "next-power-of-two"],
-            vec!["--conv-algo", "exhaustive"],
-            vec!["--graph-opt", "3"],
+            vec!["--model", "nano-0.8-int8"],
+            vec!["--model", "micro-0.8"],
+            vec!["--repo-id", "someone/model"],
+            vec!["--ort-lib", "runtime"],
+            vec!["--cuda-lib-dir", "cuda"],
+            vec!["--cudnn-lib-dir", "cudnn"],
+            vec!["--cuda-device-id", "0"],
+            vec!["--cuda-memory-limit", "2048"],
+            vec!["--arena-strategy", "same-as-requested"],
+            vec!["--conv-algo", "heuristic"],
+            vec!["--graph-opt", "1"],
+            vec!["--vram-profile", "minimal"],
             vec!["--memory-pattern"],
             vec!["--parallel-execution"],
+            vec!["--style-index", "3"],
+            vec!["--trim-tail", "5000"],
+            vec!["--phonemizer", "espeak-ng"],
         ] {
-            assert_eq!(
-                auto_native_intent(&parse_synthesis_args(&extra)),
-                AutoNativeIntent::None,
-                "{extra:?}"
+            for command in ["synthesize", "stream", "play"] {
+                let mut argv = vec!["kitten-tts", command, "--text", "hello"];
+                argv.extend_from_slice(&extra);
+                let err = Cli::try_parse_from(argv).unwrap_err();
+                assert!(
+                    matches!(
+                        err.kind(),
+                        clap::error::ErrorKind::UnknownArgument
+                            | clap::error::ErrorKind::InvalidValue
+                    ),
+                    "{command} {extra:?}: {err}"
+                );
+            }
+        }
+        assert!(Cli::try_parse_from(["kitten-tts", "model", "fetch"]).is_err());
+    }
+
+    #[test]
+    fn missing_native_library_never_falls_back() {
+        for engine in ["native", "auto"] {
+            let args =
+                parse_synthesis_args(&["--engine", engine, "--native-lib", "/missing/libaudiocpp"]);
+            let err = match prepare_synthesis_runtime(&args) {
+                Err(err) => err,
+                Ok(_) => panic!("missing library should fail"),
+            };
+            assert!(
+                format!("{err:#}").contains("failed to load native audio.cpp"),
+                "{err:#}"
             );
         }
     }
 
     #[test]
-    fn auto_engine_honours_explicit_native_intent() {
-        assert_eq!(
-            auto_native_intent(&parse_synthesis_args(&[
-                "--native-model",
-                "/tmp/model.gguf"
-            ])),
-            AutoNativeIntent::Required
+    fn native_kitten_tts2_requires_local_model_even_with_license() {
+        let args =
+            parse_synthesis_args(&["--native-family", "kitten_tts2", "--accept-kitten2-license"]);
+        assert!(
+            validate_native_args(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("--native-model")
         );
-        assert_eq!(
-            auto_native_intent(&parse_synthesis_args(&["--native-family", "kitten_tts2"])),
-            AutoNativeIntent::Required
+    }
+
+    #[test]
+    fn native_rejects_mislabelled_sample_rate() {
+        let args = parse_synthesis_args(&["--sample-rate", "48000"]);
+        assert!(
+            validate_native_args(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("24000")
         );
+    }
+
+    #[test]
+    fn native_audio_must_be_finite_and_non_silent() {
+        for audio in [
+            vec![],
+            vec![0.0; 10],
+            vec![1e-8; 10],
+            vec![0.1, f32::NAN],
+            vec![f32::INFINITY],
+            vec![f32::NEG_INFINITY],
+        ] {
+            let err = validate_native_audio(&audio).unwrap_err();
+            assert!(err.downcast_ref::<NativeAudioError>().is_some());
+        }
+        assert!(validate_native_audio(&[0.0, 0.1, -0.2]).is_ok());
+    }
+
+    #[test]
+    fn native_guardrails_reject_unsafe_input_before_library_load() {
+        for extra in [
+            vec!["--speed", "NaN"],
+            vec!["--speed", "0.4"],
+            vec!["--max-chars", "0"],
+            vec!["--max-chars", "2001"],
+        ] {
+            let err = match prepare_synthesis_runtime(&parse_synthesis_args(&extra)) {
+                Err(err) => err,
+                Ok(_) => panic!("unsafe input should fail"),
+            };
+            let expected = if extra[0] == "--speed" {
+                "speed must"
+            } else {
+                "max_chars must"
+            };
+            assert!(err.to_string().contains(expected), "{err:#}");
+        }
+        assert!(prepare_native_chunks(&"x".repeat(MAX_TOTAL_INPUT_CHARS + 1), 1.0, 400).is_err());
+        assert!(prepare_native_chunks(&"x. ".repeat(MAX_SYNTHESIS_CHUNKS + 1), 1.0, 1).is_err());
     }
 
     #[test]
@@ -3842,20 +2381,6 @@ mod tests {
         let args = parse_synthesis_args(&["--engine", "native", "--native-threads", "0"]);
         let err = validate_native_args(&args).unwrap_err().to_string();
         assert!(err.contains("between 1 and 256"), "{err}");
-    }
-
-    #[test]
-    fn native_rejects_style_index() {
-        let args = parse_synthesis_args(&["--engine", "native", "--style-index", "3"]);
-        let err = validate_native_args(&args).unwrap_err().to_string();
-        assert!(err.contains("--style-index"), "{err}");
-    }
-
-    #[test]
-    fn native_rejects_non_mini_preset_without_override() {
-        let args = parse_synthesis_args(&["--engine", "native", "--model", "nano-0.8-fp32"]);
-        let err = validate_native_args(&args).unwrap_err().to_string();
-        assert!(err.contains("Mini 0.8"), "{err}");
     }
 
     #[test]

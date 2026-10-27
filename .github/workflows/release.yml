@@ -37,110 +37,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install CUDA/cuDNN runtime libraries (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          wget -qO- https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/3bf863cc.pub \
-            | sudo gpg --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/ /" \
-            | sudo tee /etc/apt/sources.list.d/cuda.list
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cuda-cudart-12-8 libcublas-12-8 libcufft-12-8 libcurand-12-8 cuda-nvrtc-12-8 \
-            libcudnn9-cuda-12
-
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Download and unpack ONNX Runtime (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          # Download ONNX Runtime GPU build
-          curl -sLO https://github.com/microsoft/onnxruntime/releases/download/v1.23.0/onnxruntime-linux-x64-gpu-1.23.0.tgz
-          tar -xzf onnxruntime-linux-x64-gpu-1.23.0.tgz
-          cp -P onnxruntime-linux-x64-gpu-1.23.0/lib/libonnxruntime*.so* target/${{ matrix.target }}/release/
-          cp -P onnxruntime-linux-x64-gpu-1.23.0/lib/libonnxruntime_providers_*.so target/${{ matrix.target }}/release/
-
-      - name: Copy CUDA/cuDNN runtime libraries (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          out="target/${{ matrix.target }}/release"
-
-          copy_pkg_files() {
-            local pkg=$1
-            local regex=$2
-            mapfile -t files < <(dpkg-query -L "$pkg" | grep -E "$regex" || true)
-            if [ ${#files[@]} -eq 0 ]; then
-              echo "::error::No files matched $regex in package $pkg"
-              exit 1
-            fi
-            cp -a "${files[@]}" "$out/"
-          }
-
-          # Query installed packages directly so we copy both soname symlinks and
-          # fully versioned targets instead of relying on brittle filesystem scans.
-          copy_pkg_files libcublas-12-8 '/libcublasLt\.so\.12(\..*)?$'
-          copy_pkg_files libcublas-12-8 '/libcublas\.so\.12(\..*)?$'
-          copy_pkg_files cuda-cudart-12-8 '/libcudart\.so\.12(\..*)?$'
-          copy_pkg_files libcufft-12-8 '/libcufft\.so\.11(\..*)?$'
-          copy_pkg_files libcurand-12-8 '/libcurand\.so\.10(\..*)?$'
-          copy_pkg_files cuda-nvrtc-12-8 '/libnvrtc\.so(\.12(\..*)?)?$'
-          copy_pkg_files cuda-nvrtc-12-8 '/libnvrtc-builtins\.so(\.12\.8(\..*)?)?$'
-          copy_pkg_files libcudnn9-cuda-12 '/libcudnn.*\.so\.9(\..*)?$'
-
-      - name: Download and unpack ONNX Runtime (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          curl -LO https://github.com/microsoft/onnxruntime/releases/download/v1.23.0/onnxruntime-osx-arm64-1.23.0.tgz
-          tar -xzf onnxruntime-osx-arm64-1.23.0.tgz
-          cp -P onnxruntime-osx-arm64-1.23.0/lib/libonnxruntime*.dylib target/${{ matrix.target }}/release/
-
-      - name: Download and unpack ONNX Runtime (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.23.0/onnxruntime-win-x64-gpu-1.23.0.zip" -OutFile "onnxruntime.zip"
-          Expand-Archive -Path "onnxruntime.zip" -DestinationPath "onnxruntime"
-          Copy-Item -Path "onnxruntime\onnxruntime-win-x64-gpu-1.23.0\lib\*.dll" -Destination "target/${{ matrix.target }}/release/"
-
-      - name: Validate Linux bundle
-        if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          rel="$PWD/target/${{ matrix.target }}/release"
-          # ldd catches missing ORT/CUDA/cuDNN dynamic deps, but NVRTC builtins are
-          # loaded internally, so they still need to be copied explicitly above.
-          LD_LIBRARY_PATH="$rel" ldd "$rel/libonnxruntime_providers_cuda.so" | tee /tmp/ldd.txt
-          ! grep -q 'not found' /tmp/ldd.txt
-
-      - name: Package artifact (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          rm -rf bundle
-          mkdir -p dist bundle
-          archive="kitten-tts-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive_ext }}"
-          rel="target/${{ matrix.target }}/release"
-
-          cp "$rel/${{ matrix.bin_name }}" bundle/
-          cp -a "$rel"/libonnxruntime* bundle/
-          cp -a "$rel"/libcublas* bundle/ || true
-          cp -a "$rel"/libcudart* bundle/ || true
-          cp -a "$rel"/libcufft* bundle/ || true
-          cp -a "$rel"/libcurand* bundle/ || true
-          cp -a "$rel"/libnvrtc* bundle/ || true
-          cp -a "$rel"/libcudnn* bundle/ || true
-
-          tar -C bundle -czf "dist/${archive}" .
-
-      - name: Package artifact (macOS)
-        if: runner.os == 'macOS'
+      - name: Package artifact (Unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist
           archive="kitten-tts-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive_ext }}"
           cd target/${{ matrix.target }}/release
-          tar -czf "../../../dist/${archive}" ${{ matrix.bin_name }} libonnxruntime*.dylib
+          COPYFILE_DISABLE=1 tar -czf "../../../dist/${archive}" ${{ matrix.bin_name }}
 
       - name: Package artifact (Windows)
         if: runner.os == 'Windows'
@@ -148,7 +54,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           $archive = "kitten-tts-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive_ext }}"
-          $files = Get-ChildItem -Path "target/${{ matrix.target }}/release" -Include "${{ matrix.bin_name }}", "*.dll" -Recurse
+          $files = "target/${{ matrix.target }}/release/${{ matrix.bin_name }}"
           Compress-Archive -Path $files -DestinationPath "dist/$archive" -Force
 
       - name: Upload build artifact

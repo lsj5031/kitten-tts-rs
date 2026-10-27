@@ -1,5 +1,10 @@
 # Native multi-model TTS backend: evaluation and decision
 
+> Historical record of the October 2026 dual-engine evaluation. The fallback,
+> ONNX commands and preservation decisions below were superseded by the
+> native-only change on 2026-10-27. They are not current usage instructions.
+> See [the README](../README.md) and [native reference](native-usage.md).
+
 Status: decision record for [#3](https://github.com/lsj5031/kitten-tts-rs/issues/3),
 researched 2026-10-24 and updated the same day with the implemented native engine
 and reproduced measurements. Sections under [Measured results](#measured-results)
