@@ -12,7 +12,7 @@ cd kitten-tts-rs
 cargo build --release
 ```
 
-Use `target/release/kitten-tts` below, or put that executable on your `PATH`. On Windows it is `target\release\kitten-tts.exe`. [Release archives](https://github.com/lsj5031/kitten-tts-rs/releases) built from this native-only revision contain just the executable. Older releases have different engines and prerequisites.
+Use `target/release/kitten-tts` below, or put that executable on your `PATH`. On Windows it is `target\release\kitten-tts.exe`. Build from source for the native-only CLI. Old ONNX release binaries have been removed. GitHub-hosted CI checks compilation, tests and basic CLI commands on Linux, macOS and Windows; it does not publish binary artifacts or verify GPU synthesis. Future binary releases must be built and runtime-tested on suitable machines with the required audio.cpp backend.
 
 You also need:
 

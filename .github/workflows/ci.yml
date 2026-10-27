@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin_name: kitten-tts
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin_name: kitten-tts
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_name: kitten-tts.exe
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
+      - name: Test
+        run: cargo test --locked --target ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      # Checks below do not load native libraries or model weights.
+      - name: Smoke CLI without native runtime
+        run: |
+          ./target/${{ matrix.target }}/release/${{ matrix.bin_name }} --help
+          ./target/${{ matrix.target }}/release/${{ matrix.bin_name }} models list
+          ./target/${{ matrix.target }}/release/${{ matrix.bin_name }} voices

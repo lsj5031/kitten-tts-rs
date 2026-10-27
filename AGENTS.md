@@ -38,7 +38,7 @@ cargo run -- synthesize --text "Hello from KittenTTS." --output output.wav
 
 Synthesis requires a user-provided audio.cpp C API shared library (ABI major 0), Mini's libespeak-ng and espeak-ng-data, and a cached or local GGUF. Pass `--native-lib PATH` or set `AUDIOCPP_LIB`. `native doctor` downloads nothing and reports all missing prerequisites. Do not claim runtime verification when prerequisites are missing. Never play audio on the user's speakers unless asked.
 
-Release CI builds Linux x86_64, macOS arm64 and Windows x86_64 binaries in `.github/workflows/release.yml`. Archives contain only the executable, not libraries or weights. Runtime verification so far is macOS arm64; other platforms/backends need independent testing.
+GitHub-hosted CI checks Linux x86_64, macOS arm64 and Windows x86_64 in .github/workflows/ci.yml. It does not upload binaries or publish releases. Prepare future binary releases on suitable machines and verify the actual audio.cpp backend there. Runtime verification so far is macOS arm64; other platforms/backends need independent testing.
 
 ## Placement and style
 
